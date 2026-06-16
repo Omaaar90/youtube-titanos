@@ -75,8 +75,8 @@ export default {
 
       // Rewrite cross-origin URLs to go via /__proxy/<host>/path
       for (const host of REWRITE_HOSTS) {
-        const re = new RegExp(`https://${host.replace(/\./g, '\\.')}/`, 'g');
-        html = html.replace(re, `/__proxy/${host}/`);
+        const re = new RegExp(`https://${host.replace(/\./g, '\\.')}`, 'g');
+        html = html.replace(re, `/__proxy/${host}`);
       }
 
       const h = new Headers(res.headers);
@@ -102,8 +102,23 @@ export default {
       const reqHeaders = new Headers(request.headers);
       reqHeaders.set('host', upHost);
       reqHeaders.set('User-Agent', TV_UA);
-      reqHeaders.set('origin', 'https://www.youtube.com');
-      reqHeaders.set('referer', 'https://www.youtube.com/tv');
+      
+      // Clean up headers to bypass bot detection / CORS issues
+      reqHeaders.delete('sec-fetch-site');
+      reqHeaders.delete('sec-fetch-mode');
+      reqHeaders.delete('sec-fetch-dest');
+      reqHeaders.delete('sec-fetch-user');
+
+      if (request.headers.has('origin')) {
+        reqHeaders.set('origin', 'https://www.youtube.com');
+      } else {
+        reqHeaders.delete('origin');
+      }
+      if (request.headers.has('referer')) {
+        reqHeaders.set('referer', 'https://www.youtube.com/tv');
+      } else {
+        reqHeaders.delete('referer');
+      }
 
       const res = await fetch(`https://${upHost}${upPath}${url.search}`, {
         method: request.method,
@@ -130,8 +145,23 @@ export default {
     const reqHeaders = new Headers(request.headers);
     reqHeaders.set('User-Agent', TV_UA);
     reqHeaders.set('host', 'www.youtube.com');
-    reqHeaders.set('origin', 'https://www.youtube.com');
-    reqHeaders.set('referer', 'https://www.youtube.com/tv');
+    
+    // Clean up headers to bypass bot detection / CORS issues
+    reqHeaders.delete('sec-fetch-site');
+    reqHeaders.delete('sec-fetch-mode');
+    reqHeaders.delete('sec-fetch-dest');
+    reqHeaders.delete('sec-fetch-user');
+
+    if (request.headers.has('origin')) {
+      reqHeaders.set('origin', 'https://www.youtube.com');
+    } else {
+      reqHeaders.delete('origin');
+    }
+    if (request.headers.has('referer')) {
+      reqHeaders.set('referer', 'https://www.youtube.com/tv');
+    } else {
+      reqHeaders.delete('referer');
+    }
 
     const res = await fetch(targetUrl.toString(), {
       method: request.method,
@@ -142,15 +172,14 @@ export default {
 
     const contentType = res.headers.get('content-type') || '';
     const isText = contentType.includes('text/') || 
-                   contentType.includes('application/javascript') || 
-                   contentType.includes('text/javascript') ||
-                   contentType.includes('application/json');
+                   contentType.includes('javascript') || 
+                   contentType.includes('json');
 
     if (isText && res.status === 200) {
       let text = await res.text();
       for (const host of REWRITE_HOSTS) {
-        const re = new RegExp(`https://${host.replace(/\./g, '\\.')}/`, 'g');
-        text = text.replace(re, `/__proxy/${host}/`);
+        const re = new RegExp(`https://${host.replace(/\./g, '\\.')}`, 'g');
+        text = text.replace(re, `/__proxy/${host}`);
       }
       
       const h = new Headers(res.headers);
