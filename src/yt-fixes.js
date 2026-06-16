@@ -162,3 +162,4 @@ function populateSearchHistory(container) {
 }
 
 window.addEventListener('beforeunload', cleanupYouTubeFixes);
+initYouTubeFixes();

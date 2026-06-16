@@ -15,7 +15,7 @@
 const GH_PAGES_BASE = 'https://Omaaar90.github.io/youtube-titanos';
 const TV_UA = 'Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/5.0 TV Safari/538.1';
 
-// Hosts whose absolute URLs in the HTML we rewrite to /__proxy/<host>/...
+// Hosts whose absolute URLs in the HTML/JS/CSS we rewrite to /__proxy/<host>/...
 // so the browser never makes a cross-origin request directly.
 const REWRITE_HOSTS = [
   'www.gstatic.com',
@@ -23,6 +23,8 @@ const REWRITE_HOSTS = [
   'suggestqueries.google.com',
   'jnn-pa.googleapis.com',
   'www.googleapis.com',
+  'redirector.googlevideo.com',
+  'eligibility-panelresearch.googlevideo.com',
 ];
 
 const CORS = {
@@ -100,8 +102,8 @@ export default {
       const reqHeaders = new Headers(request.headers);
       reqHeaders.set('host', upHost);
       reqHeaders.set('User-Agent', TV_UA);
-      reqHeaders.delete('origin');
-      reqHeaders.delete('referer');
+      reqHeaders.set('origin', 'https://www.youtube.com');
+      reqHeaders.set('referer', 'https://www.youtube.com/tv');
 
       const res = await fetch(`https://${upHost}${upPath}${url.search}`, {
         method: request.method,
@@ -128,8 +130,8 @@ export default {
     const reqHeaders = new Headers(request.headers);
     reqHeaders.set('User-Agent', TV_UA);
     reqHeaders.set('host', 'www.youtube.com');
-    reqHeaders.delete('origin');
-    reqHeaders.delete('referer');
+    reqHeaders.set('origin', 'https://www.youtube.com');
+    reqHeaders.set('referer', 'https://www.youtube.com/tv');
 
     const res = await fetch(targetUrl.toString(), {
       method: request.method,
@@ -137,6 +139,30 @@ export default {
       body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : undefined,
       redirect: 'follow',
     });
+
+    const contentType = res.headers.get('content-type') || '';
+    const isText = contentType.includes('text/') || 
+                   contentType.includes('application/javascript') || 
+                   contentType.includes('text/javascript') ||
+                   contentType.includes('application/json');
+
+    if (isText && res.status === 200) {
+      let text = await res.text();
+      for (const host of REWRITE_HOSTS) {
+        const re = new RegExp(`https://${host.replace(/\./g, '\\.')}/`, 'g');
+        text = text.replace(re, `/__proxy/${host}/`);
+      }
+      
+      const h = new Headers(res.headers);
+      h.delete('content-security-policy');
+      h.delete('content-security-policy-report-only');
+      h.delete('x-frame-options');
+      h.delete('content-encoding');   // decoded by .text()
+      h.delete('transfer-encoding');
+      for (const [k, v] of Object.entries(CORS)) h.set(k, v);
+      
+      return new Response(text, { status: res.status, headers: h });
+    }
 
     const h = new Headers(res.headers);
     h.delete('content-security-policy');
