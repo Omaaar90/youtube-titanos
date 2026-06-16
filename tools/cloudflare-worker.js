@@ -133,7 +133,7 @@ function cleanRequestHeaders(reqHeaders) {
   reqHeaders.delete('cf-ipcountry');
   reqHeaders.delete('if-none-match');
   reqHeaders.delete('if-modified-since');
-  // Do NOT forward x-forwarded-for — causes bot-detection 403s
+  reqHeaders.delete('x-forwarded-for'); // Do NOT forward x-forwarded-for — causes bot-detection 403s
 }
 
 export default {
@@ -327,16 +327,20 @@ export default {
     // FIX: OAuth device flow lives on oauth2.googleapis.com, not youtube.com
     const isOAuthPath = url.pathname.startsWith('/o/oauth2/') || 
                         url.pathname.startsWith('/oauth2/');
+    const isInitPlayback = url.pathname.startsWith('/initplayback');
 
     const targetUrl = new URL(request.url);
     targetUrl.protocol = 'https:';
-    targetUrl.hostname = isOAuthPath ? 'oauth2.googleapis.com' : 'www.youtube.com';
-    targetUrl.port = '';
-
-    // Remap /o/oauth2/... to /... on oauth2.googleapis.com
-    if (isOAuthPath && url.pathname.startsWith('/o/oauth2/')) {
-      targetUrl.pathname = url.pathname.slice(9);
+    
+    if (isOAuthPath) {
+      targetUrl.hostname = 'oauth2.googleapis.com';
+      targetUrl.pathname = url.pathname.replace(/^\/o\/oauth2/, '/oauth2');
+    } else if (isInitPlayback) {
+      targetUrl.hostname = 'redirector.googlevideo.com';
+    } else {
+      targetUrl.hostname = 'www.youtube.com';
     }
+    targetUrl.port = '';
 
     const reqHeaders = new Headers(request.headers);
     reqHeaders.set('host', targetUrl.hostname);
