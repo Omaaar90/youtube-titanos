@@ -36,9 +36,21 @@ npm run build
 ### Testing on TitanOS TV
 
 1. Build the project: `npm run build`
-2. Host the `dist/` folder on a web server accessible to your TV
+2. Host the `dist/` folder on a web server accessible to your TV (or use GitHub Pages)
 3. On your TitanOS TV, open **DevView** (from the app store)
 4. Enter your server URL to load the app in the sandbox
+
+### Testing on Desktop Browser (User-Agent Spoofing)
+
+YouTube TV (`youtube.com/tv`) will automatically redirect desktop browsers to the desktop site (`youtube.com/?app=desktop`). To test and debug the app on a desktop browser:
+
+1. Open your hosted app (e.g., your GitHub Pages URL or `http://localhost:8080`).
+2. Open Chrome DevTools (`F12` or `Ctrl+Shift+I`).
+3. Click the three vertical dots menu in the top-right of DevTools -> **More tools** -> **Network conditions**.
+4. Under **User agent**, uncheck **Use browser default**.
+5. Select a TV user agent (e.g., **Android TV** or **Samsung Tizen Smart TV**), or paste a custom one:
+   `Mozilla/5.0 (WebOS; SmartTV) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36`
+6. Refresh the page. It will now load YouTube TV without redirecting.
 
 ## Project Structure
 
