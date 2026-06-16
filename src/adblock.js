@@ -143,6 +143,8 @@ const SCHEMA_REGISTRY = {
 };
 
 let origParse = JSON.parse;
+let originalResponseJson = null;
+let originalXhrResponseDescriptor = null;
 let isHooked = false;
 
 // --- CORE FUNCTIONS ---
@@ -361,11 +363,9 @@ function logSchemaMiss(data, textLength) {
   }
 }
 
-function hookedParse(text, reviver) {
-  const data = origParse.call(this, text, reviver);
-  if (!text || text.length < 500 || !data || typeof data !== 'object') return data;
+export function filterJsonObject(data, textHint = '') {
+  if (!data || typeof data !== 'object') return data;
   if (!anyFilterEnabled) return data;
-  if (!RESPONSE_NEEDLE_RE.test(text)) return data;
   if (data.botguardData) return data;
 
   try {
@@ -383,9 +383,15 @@ function hookedParse(text, reviver) {
     } else if (responseType === 'ACTION' || responseType === 'PLAYER') {
       if (DEBUG) debugLog(`Schema Match: [${responseType}]`);
       applySchemaFilters(data, responseType, cfgFlags, needsContentFiltering);
-    } else if(text.length > 10000 && !Array.isArray(data)) {
-      if (DEBUG) logSchemaMiss(data, text.length);
-      applyFallbackFilters(data, cfgFlags, needsContentFiltering);
+    } else {
+      if (!Array.isArray(data)) {
+        const approxLength = textHint ? textHint.length : 0;
+        const looksLikeBigResponse = approxLength > 10000 || data.playerResponse || data.contents || data.streamingData || data.adPlacements || data.adSlots || data.playerAds;
+        if (looksLikeBigResponse) {
+          if (DEBUG) logSchemaMiss(data, approxLength || 10000);
+          applyFallbackFilters(data, cfgFlags, needsContentFiltering);
+        }
+      }
     }
 
     if (cfgFlags.enableLegacyEmojiFix && data.frameworkUpdates) {
@@ -401,6 +407,14 @@ function hookedParse(text, reviver) {
     if (DEBUG) console.error('[AdBlock] Error during filtering:', e);
   }
   return data;
+}
+
+function hookedParse(text, reviver) {
+  const data = origParse.call(this, text, reviver);
+  if (!text || text.length < 500 || !data || typeof data !== 'object') return data;
+  if (!anyFilterEnabled) return data;
+  if (!RESPONSE_NEEDLE_RE.test(text)) return data;
+  return filterJsonObject(data, text);
 }
 
 function detectResponseType(data) {
@@ -768,14 +782,60 @@ export function initAdblock() {
 
   origParse = JSON.parse;
   JSON.parse = function (text, reviver) { return hookedParse.call(this, text, reviver); };
+
+  if (typeof Response !== 'undefined' && Response.prototype && Response.prototype.json) {
+    originalResponseJson = Response.prototype.json;
+    Response.prototype.json = async function () {
+      const data = await originalResponseJson.call(this);
+      try {
+        return filterJsonObject(data);
+      } catch (e) {
+        if (DEBUG) console.error('[AdBlock] Error filtering Response.json:', e);
+        return data;
+      }
+    };
+  }
+
+  if (typeof XMLHttpRequest !== 'undefined' && XMLHttpRequest.prototype) {
+    const descriptor = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, 'response');
+    if (descriptor && descriptor.get) {
+      originalXhrResponseDescriptor = descriptor;
+      Object.defineProperty(XMLHttpRequest.prototype, 'response', {
+        get: function () {
+          const val = descriptor.get.call(this);
+          if (this.responseType === 'json' && val && typeof val === 'object') {
+            if (this.__adblockFilteredResponse === undefined) {
+              this.__adblockFilteredResponse = filterJsonObject(val);
+            }
+            return this.__adblockFilteredResponse;
+          }
+          return val;
+        },
+        configurable: true,
+        enumerable: true
+      });
+    }
+  }
+
   isHooked = true;
 }
 
 export function destroyAdblock() {
   if (!isHooked) return;
-  if (DEBUG) console.info('[AdBlock] Restoring JSON.parse');
+  if (DEBUG) console.info('[AdBlock] Restoring JSON.parse and response hooks');
   
   JSON.parse = origParse;
+
+  if (originalResponseJson) {
+    Response.prototype.json = originalResponseJson;
+    originalResponseJson = null;
+  }
+
+  if (originalXhrResponseDescriptor) {
+    Object.defineProperty(XMLHttpRequest.prototype, 'response', originalXhrResponseDescriptor);
+    originalXhrResponseDescriptor = null;
+  }
+
   isHooked = false;
 }
 
