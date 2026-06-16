@@ -113,11 +113,14 @@ async function boot() {
 
   // 5. Hide loading screen
   const loadingScreen = document.getElementById('loading-screen');
-  if (loadingScreen) {
-    loadingScreen.style.transition = 'opacity 0.3s ease';
-    loadingScreen.style.opacity = '0';
-    loadingScreen.addEventListener('transitionend', () => loadingScreen.remove(), { once: true });
+  if (!loadingScreen) {
+    console.info('[YT-TitanOS] Running inside proxied YouTube TV. Skipping redirect.');
+    return;
   }
+
+  loadingScreen.style.transition = 'opacity 0.3s ease';
+  loadingScreen.style.opacity = '0';
+  loadingScreen.addEventListener('transitionend', () => loadingScreen.remove(), { once: true });
 
   // 6. Navigate to YouTube TV
   // We use location.replace so the user can't "back" into our loading screen
