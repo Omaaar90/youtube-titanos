@@ -96,6 +96,13 @@ async function registerHooks() {
 async function boot() {
   console.info('[YT-TitanOS] Booting...');
 
+  // Register Service Worker for network-level intercepts (CORS/redirects)
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js', { scope: '/' })
+      .then(reg => console.info('[YT-TitanOS] SW registered:', reg.scope))
+      .catch(err => console.warn('[YT-TitanOS] SW registration failed:', err));
+  }
+
   // 1. Get device info (async, non-blocking)
   getDeviceInfo().then((info) => {
     console.info('[YT-TitanOS] Running on:', info);
