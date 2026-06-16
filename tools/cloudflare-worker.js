@@ -18,8 +18,15 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // 1. Serve our local app assets (index.js, assets/*) from GitHub Pages
-    if (url.pathname === '/index.js' || url.pathname.startsWith('/assets/')) {
+    // 1. Serve our local app assets (index.js, chunk files, css, assets/*) from GitHub Pages
+    const isProjectAsset = 
+      url.pathname === '/index.js' || 
+      url.pathname.endsWith('.index.js') || 
+      url.pathname.startsWith('/assets/') ||
+      url.pathname.endsWith('.css') ||
+      url.pathname.endsWith('.js.map');
+
+    if (isProjectAsset) {
       const assetUrl = `${GH_PAGES_BASE}${url.pathname}`;
       const response = await fetch(assetUrl);
       
