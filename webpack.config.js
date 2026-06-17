@@ -12,7 +12,7 @@ const makeConfig = (env, argv) => {
   const isProd = argv.mode === 'production';
 
   return {
-    target: 'browserslist:chrome 87',
+    target: 'browserslist:chrome 60',
     devtool: isProd ? false : 'source-map',
     entry: './src/index.js',
     output: {
@@ -30,13 +30,7 @@ const makeConfig = (env, argv) => {
           use: ['style-loader', 'css-loader'],
         },
         {
-          test: /\.js$/,
-          resolve: {
-            fullySpecified: false,
-          },
-        },
-        {
-          test: /\.ts$/,
+          test: /\.(js|ts)$/,
           use: {
             loader: 'ts-loader',
             options: { transpileOnly: true },
