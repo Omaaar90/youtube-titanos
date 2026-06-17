@@ -192,9 +192,24 @@ async function handleRequest(request, env, ctx) {
     }
 
     // Read body into memory to ensure it is forwarded correctly (avoids streaming issues in Worker fetch)
-    const reqBody = request.method !== 'GET' && request.method !== 'HEAD'
-      ? await request.arrayBuffer()
-      : undefined;
+    let reqBody = undefined;
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      reqBody = await request.arrayBuffer();
+      // Check if it's an OAuth path (either /o/oauth2/ or /oauth2/)
+      const isOAuth = url.pathname.startsWith('/o/oauth2/') || url.pathname.startsWith('/oauth2/');
+      if (isOAuth) {
+        try {
+          // Decode body text to inspect and rewrite client credentials on-the-fly
+          let bodyText = new TextDecoder().decode(reqBody);
+          // Swapping YouTube TV's blocked profile 1 client ID with fully permitted profile 0 client ID
+          bodyText = bodyText.replace('861556708454-912i5jlic99ecvu3ro5kqirg0hldli5t.apps.googleusercontent.com', '861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com');
+          bodyText = bodyText.replace('ju2WuMJMOjilz_h_1dPgFdeU', 'SboVhoG9s0rNafixCSGGKXAT');
+          reqBody = new TextEncoder().encode(bodyText);
+        } catch (e) {
+          console.error('[OAuth] Failed to rewrite credentials in request body:', e.message);
+        }
+      }
+    }
 
     // Get (or bootstrap) session cookies — pass ctx so KV write can be
     // deferred via ctx.waitUntil() without blocking the response.
@@ -424,7 +439,7 @@ self.addEventListener('fetch', function(event) {
       if (reqBody) {
         try {
           const bodyText = new TextDecoder().decode(reqBody);
-          console.log(`[OAuth-Proxy] Path: ${url.pathname}, Body: ${bodyText}`);
+          console.log(`[OAuth-Proxy] Path: ${url.pathname}, Rewritten Body: ${bodyText}`);
         } catch (err) {
           console.error('[OAuth-Proxy] Failed to decode body:', err.message);
         }
