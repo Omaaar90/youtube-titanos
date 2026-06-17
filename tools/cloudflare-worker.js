@@ -236,7 +236,64 @@ export default {
       const res = await fetch(ytUrl.toString(), { headers: reqHeaders });
       let html = await res.text();
 
-      html = html.replace('<head>', '<head><script src="/index.js"></script>');
+      // Inject our bundle + an inline XHR/fetch monkey-patch for runtime googlevideo URLs
+      const WORKER_ORIGIN = url.origin;
+      // FIX 1: Use new RegExp() so backslashes are not mangled when the
+      // template-literal string is embedded inside an HTML attribute/script tag.
+      // FIX 2: Patch XHR at the *constructor* level (Object.defineProperty) so
+      // code that cached window.XMLHttpRequest before our script ran is still
+      // intercepted (the YouTube player does this internally).
+      const inlineInterceptor = `<script>
+(function(){
+  var WORKER = ${JSON.stringify(WORKER_ORIGIN)};
+  // Use RegExp constructor — regex literals inside template-literal→HTML strings
+  // have their backslashes double-evaluated, causing SyntaxError.
+  var GV_RE = new RegExp('https?:\\/\\/([a-z0-9\\-]+\\.googlevideo\\.com)');
+
+  function rewriteGV(url) {
+    if (typeof url !== 'string') return url;
+    var m = url.match(GV_RE);
+    return m ? url.replace(m[0], WORKER + '/__proxy/' + m[1]) : url;
+  }
+
+  // ── Patch fetch ──────────────────────────────────────────────────────────
+  var _fetch = window.fetch;
+  window.fetch = function(input, init) {
+    var url = (typeof input === 'string') ? input : (input && input.url) || '';
+    var rw = rewriteGV(url);
+    if (rw !== url) {
+      if (typeof input === 'string') input = rw;
+      else if (input && input.url) input = new Request(rw, input);
+    }
+    return _fetch.call(this, input, init);
+  };
+
+  // ── Patch XHR prototype.open (catches new XHR() after this script) ───────
+  var _open = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url) {
+    return _open.apply(this, [method, rewriteGV(url)].concat(
+      Array.prototype.slice.call(arguments, 2)
+    ));
+  };
+
+  // ── Patch XHR constructor (catches cached references taken before this) ──
+  // The YouTube player stores: var XHR = window.XMLHttpRequest; early on.
+  // Overriding the global constructor makes those cached refs go through our
+  // patched prototype because they still share the same prototype chain.
+  // Additional safety: wrap the constructor so any 'new XHR()' call from a
+  // captured reference gets an object whose prototype.open is already patched.
+  try {
+    var _NativeXHR = window.XMLHttpRequest;
+    var _PatchedXHR = function() { return new _NativeXHR(); };
+    _PatchedXHR.prototype = _NativeXHR.prototype; // share prototype — patch above applies
+    Object.defineProperty(window, 'XMLHttpRequest', {
+      get: function() { return _PatchedXHR; },
+      configurable: true,
+    });
+  } catch(e) {}
+})();
+<\/script>`;
+      html = html.replace('<head>', '<head>' + inlineInterceptor + '<script src="/index.js"></script>');
 
       // Rewrite static host URLs
       html = rewriteHosts(html);
@@ -334,7 +391,8 @@ export default {
     
     if (isOAuthPath) {
       targetUrl.hostname = 'oauth2.googleapis.com';
-      targetUrl.pathname = url.pathname.replace(/^\/o\/oauth2/, '/oauth2');
+      // Keep the /o/ prefix — oauth2.googleapis.com expects /o/oauth2/...
+      // (do NOT strip it, the path maps as-is)
     } else if (isInitPlayback) {
       targetUrl.hostname = 'redirector.googlevideo.com';
     } else {

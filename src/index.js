@@ -96,10 +96,17 @@ async function registerHooks() {
 async function boot() {
   console.info('[YT-TitanOS] Booting...');
 
-  // Register Service Worker for network-level intercepts (CORS/redirects)
+  // Register Service Worker for network-level intercepts (CORS/redirects).
+  // updateViaCache:'none' prevents the browser from serving a stale SW from
+  // the HTTP cache. reg.update() forces an immediate activation check so the
+  // SW takes control before YouTube's player starts making /initplayback XHRs.
   if ('serviceWorker' in navigator) {
-    navigator.serviceWorker.register('/sw.js', { scope: '/' })
-      .then(reg => console.info('[YT-TitanOS] SW registered:', reg.scope))
+    navigator.serviceWorker.register('/sw.js', { scope: '/', updateViaCache: 'none' })
+      .then(reg => {
+        console.info('[YT-TitanOS] SW registered:', reg.scope);
+        // Trigger update check so a newly installed SW activates immediately.
+        reg.update();
+      })
       .catch(err => console.warn('[YT-TitanOS] SW registration failed:', err));
   }
 
