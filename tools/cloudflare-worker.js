@@ -3,8 +3,9 @@
  *
  * v4 changes:
  *  - Catch-all GOOGLE_FAMILY_RE replaces fragile per-host pattern lists.
- *  - ES5-safe location spoof (no Proxy) for Vewd/Chromium 60 compatibility.
+ *  - ES5-safe injected script for Vewd/Chromium 60 compatibility.
  *  - youtubei/v1/* API calls forwarded with original auth headers untouched.
+ *  - No window.location spoof (non-configurable in Vewd); debug banner is cosmetic.
  */
 
 const GH_PAGES_BASE = 'https://Omaaar90.github.io/youtube-titanos';
@@ -150,10 +151,8 @@ async function handleRequest(request, env, ctx) {
     }
 
     // ── Fast-path: youtubei/v1/* API calls ────────────────────────────────
-    // These are XHR/fetch calls made by YouTube TV's JS with their own
-    // Authorization and X-Goog-* headers already set correctly for
-    // www.youtube.com. We must NOT overwrite cookies or auth headers here —
-    // just change the hostname and add CORS. Touching auth headers causes 403.
+    // These carry their own Authorization / X-Goog-* auth headers set by
+    // YouTube TV's JS. Do NOT overwrite cookies or auth — just fix the host.
     if (url.pathname.startsWith('/youtubei/')) {
       const apiUrl = new URL(request.url);
       apiUrl.protocol = 'https:';
@@ -169,7 +168,6 @@ async function handleRequest(request, env, ctx) {
       reqHeaders.set('host', 'www.youtube.com');
       reqHeaders.set('origin', 'https://www.youtube.com');
       reqHeaders.set('referer', 'https://www.youtube.com/tv');
-      // Remove Cloudflare-injected headers only — leave auth untouched
       reqHeaders.delete('cf-connecting-ip');
       reqHeaders.delete('cf-ray');
       reqHeaders.delete('cf-visitor');
@@ -296,43 +294,17 @@ self.addEventListener('fetch', function(event) {
       const WORKER_ORIGIN = url.origin;
       const GOOGLE_RE_SRC = String.raw`(?:googlevideo|ytimg|ggpht|gstatic|googleapis)\.com$|doubleclick\.(?:com|net)$|(?:^|\.)(?:youtube|google)\.com$`;
 
-      // NOTE: The injected script must be pure ES5 — Vewd browser on TitanOS
-      // uses a Chromium ~60 engine (c.2019) which lacks full Proxy support.
-      // No Proxy, no optional chaining, no nullish coalescing, no template
-      // literals inside the serialised string — use string concatenation only.
+      // Injected script must be pure ES5 — Vewd (Chromium ~60, 2019) has no
+      // Proxy, optional chaining, nullish coalescing, or redefine on location.
+      // Use _rl (captured real window.location) for all navigation so we never
+      // touch window.location after capture.
       const inlineInterceptor = '<script>\n' +
 '(function(){\n' +
 '  var WORKER = ' + JSON.stringify(WORKER_ORIGIN) + ';\n' +
 '  var GOOGLE_RE = new RegExp(' + JSON.stringify(GOOGLE_RE_SRC) + ');\n' +
-'\n' +
-'  // FIX 1: ES5-safe location spoof.\n' +
-'  // YouTube TV checks location.hostname to decide whether to show the\n' +
-'  // "NO DEBUG ACCESS" red banner. We replace window.location with a plain\n' +
-'  // frozen object that reports www.youtube.com for hostname/host/origin\n' +
-'  // while keeping the real href/assign/replace for actual navigation.\n' +
-'  // We do NOT use Proxy because Vewd (Chromium 60, 2019) crashes on it.\n' +
-'  try {\n' +
-'    var _rl = window.location;\n' +
-'    var _fakeLocation = {\n' +
-'      hostname : "www.youtube.com",\n' +
-'      host     : "www.youtube.com",\n' +
-'      origin   : "https://www.youtube.com",\n' +
-'      protocol : "https:",\n' +
-'      port     : "",\n' +
-'      pathname : _rl.pathname,\n' +
-'      search   : _rl.search,\n' +
-'      hash     : _rl.hash,\n' +
-'      href     : _rl.href.replace(WORKER, "https://www.youtube.com"),\n' +
-'      assign   : function(u) { _rl.assign(u); },\n' +
-'      replace  : function(u) { _rl.replace(u); },\n' +
-'      reload   : function()  { _rl.reload(); },\n' +
-'      toString : function()  { return _fakeLocation.href; }\n' +
-'    };\n' +
-'    Object.defineProperty(window, "location", {\n' +
-'      get: function() { return _fakeLocation; },\n' +
-'      configurable: true\n' +
-'    });\n' +
-'  } catch(e) { console.warn("[titanos] location spoof failed:", e); }\n' +
+'  // Capture real location once — use _rl for all navigation.\n' +
+'  // We do NOT redefine window.location: it is non-configurable in Vewd.\n' +
+'  var _rl = window.location;\n' +
 '\n' +
 '  function isGoogleHost(u) {\n' +
 '    try { return GOOGLE_RE.test(new URL(u).hostname); } catch(e) { return false; }\n' +
@@ -377,9 +349,7 @@ self.addEventListener('fetch', function(event) {
 '    ));\n' +
 '  };\n' +
 '\n' +
-'  // FIX 2: Block about:blank / empty window.open calls.\n' +
-'  // YouTube TV opens a blank tab as step 1 of video navigation.\n' +
-'  // On Vewd (single-tab) this destroys the session. Return null.\n' +
+'  // FIX: Block about:blank / empty window.open — kills session on Vewd.\n' +
 '  var _winOpen = window.open;\n' +
 '  window.open = function(u, target, features) {\n' +
 '    if (!u || u === "about:blank" || u === "about:newtab" || u === "") return null;\n' +
@@ -427,7 +397,7 @@ self.addEventListener('fetch', function(event) {
 '})();\n' +
 '<\/script>\n' +
 '<style>\n' +
-'  /* FIX 3: Hide cursor — TV uses remote, no mouse needed */\n' +
+'  /* Hide cursor — TV is remote-controlled, no mouse needed */\n' +
 '  *, *::before, *::after { cursor: none !important; }\n' +
 '<\/style>';
 
