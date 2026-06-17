@@ -3,18 +3,14 @@
  *
  * v4 changes:
  *  - Catch-all GOOGLE_FAMILY_RE replaces fragile per-host pattern lists.
- *    Any *.googlevideo.com, *.c.youtube.com, *.ytimg.com, *.ggpht.com,
- *    *.gstatic.com, *.googleapis.com, *.google.com, accounts.google.com,
- *    *.doubleclick.net request is intercepted automatically — no more
- *    whack-a-mole when YouTube adds a new CDN edge hostname.
+ *  - ES5-safe location spoof (no Proxy) for Vewd/Chromium 60 compatibility.
  */
 
 const GH_PAGES_BASE = 'https://Omaaar90.github.io/youtube-titanos';
 const TV_UA = 'Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/5.0 TV Safari/538.1';
 const SESSION_KV_KEY = 'yt_session_cookies';
-const SESSION_TTL = 60 * 60; // refresh session every 1 hour
+const SESSION_TTL = 60 * 60;
 
-// Single source-of-truth for every Google/YouTube domain family we proxy.
 const GOOGLE_FAMILY_RE = /(?:googlevideo|ytimg|ggpht|gstatic|googleapis)\.com$|doubleclick\.(?:com|net)$|(?:^|\.)(?:youtube|google|accounts\.google)\.com$/;
 
 const CORS = {
@@ -258,141 +254,140 @@ self.addEventListener('fetch', function(event) {
       const WORKER_ORIGIN = url.origin;
       const GOOGLE_RE_SRC = String.raw`(?:googlevideo|ytimg|ggpht|gstatic|googleapis)\.com$|doubleclick\.(?:com|net)$|(?:^|\.)(?:youtube|google)\.com$`;
 
-      const inlineInterceptor = `<script>
-(function(){
-  var WORKER = ${JSON.stringify(WORKER_ORIGIN)};
-  var GOOGLE_RE = new RegExp(${JSON.stringify(GOOGLE_RE_SRC)});
-
-  // ── FIX 1: Spoof window.location so YouTube's internal debug check sees
-  // 'www.youtube.com' as the hostname. Without this, YouTube TV injects a red
-  // "NO DEBUG ACCESS DOMAIN=<your-worker-url>" banner on every page load.
-  try {
-    var _realLocation = window.location;
-    Object.defineProperty(window, 'location', {
-      get: function() {
-        return new Proxy(_realLocation, {
-          get: function(target, prop) {
-            if (prop === 'hostname' || prop === 'host') return 'www.youtube.com';
-            if (prop === 'origin') return 'https://www.youtube.com';
-            if (prop === 'href') return target.href.replace(WORKER, 'https://www.youtube.com');
-            var val = target[prop];
-            return (typeof val === 'function') ? val.bind(target) : val;
-          }
-        });
-      },
-      configurable: true,
-    });
-  } catch(e) { console.warn('[titanos] location spoof failed:', e); }
-
-  function isGoogleHost(url) {
-    try { return GOOGLE_RE.test(new URL(url).hostname); } catch(e) { return false; }
-  }
-
-  function rewriteGV(url) {
-    if (typeof url !== 'string' || !isGoogleHost(url)) return url;
-    var host = new URL(url).hostname;
-    if (url.startsWith(WORKER)) return url;
-    return url.replace(/https?:\/\/[^\/?#]+/, WORKER + '/__proxy/' + host);
-  }
-
-  function rewriteUrl(url) {
-    if (typeof url !== 'string') return url;
-    if (url.startsWith(WORKER)) return url;
-    try {
-      var u = new URL(url, window.location.href);
-      if (u.hostname === 'www.youtube.com' || u.hostname === 'youtube.com') {
-        return WORKER + u.pathname + u.search + u.hash;
-      }
-    } catch(e) {}
-    return url;
-  }
-
-  // ── Patch fetch ───────────────────────────────────────────────────────────
-  var _fetch = window.fetch;
-  window.fetch = function(input, init) {
-    var url = (typeof input === 'string') ? input : (input && input.url) || '';
-    var rw = rewriteGV(url);
-    if (rw !== url) {
-      if (typeof input === 'string') input = rw;
-      else if (input && input.url) input = new Request(rw, input);
-    }
-    return _fetch.call(this, input, init);
-  };
-
-  // ── Patch XHR ─────────────────────────────────────────────────────────────
-  var _open = XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open = function(method, url) {
-    return _open.apply(this, [method, rewriteGV(url)].concat(
-      Array.prototype.slice.call(arguments, 2)
-    ));
-  };
-  try {
-    var _NativeXHR = window.XMLHttpRequest;
-    var _PatchedXHR = function() { return new _NativeXHR(); };
-    _PatchedXHR.prototype = _NativeXHR.prototype;
-    Object.defineProperty(window, 'XMLHttpRequest', {
-      get: function() { return _PatchedXHR; },
-      configurable: true,
-    });
-  } catch(e) {}
-
-  // ── FIX 2: Block about:blank tab opens (TV browser video playback fix) ────
-  // YouTube TV uses window.open('about:blank','_blank') as step 1 of a
-  // two-phase video navigation. On a single-tab TV browser like Vewd this
-  // creates a blank tab and kills the session. Return null to abort it.
-  var _winOpen = window.open.bind(window);
-  window.open = function(url, target, features) {
-    // Block any call that would produce a blank/empty tab
-    if (!url || url === 'about:blank' || url === 'about:newtab' || url === '') return null;
-    url = rewriteUrl(url);
-    if (target === '_self' || target === '_top' || target === '_parent') {
-      return _winOpen(url, target, features);
-    }
-    // All other targets (_blank, named) → same-tab navigation
-    window.location.href = url;
-    return null;
-  };
-
-  // Strip target="_blank" from injected anchors via MutationObserver
-  var _mo = new MutationObserver(function(mutations) {
-    for (var i = 0; i < mutations.length; i++) {
-      var nodes = mutations[i].addedNodes;
-      for (var j = 0; j < nodes.length; j++) {
-        var node = nodes[j];
-        if (node.nodeType !== 1) continue;
-        if (node.tagName === 'A' && node.target) node.removeAttribute('target');
-        var anchors = node.querySelectorAll ? node.querySelectorAll('a[target]') : [];
-        for (var k = 0; k < anchors.length; k++) anchors[k].removeAttribute('target');
-      }
-    }
-  });
-  _mo.observe(document.documentElement || document, { childList: true, subtree: true });
-
-  // Click capture — rewrite cross-origin YouTube links to go via Worker
-  document.addEventListener('click', function(e) {
-    var a = e.target && e.target.closest ? e.target.closest('a') : null;
-    if (!a) return;
-    var t = a.getAttribute('target');
-    if (t && (t === '_blank' || t === '_new')) a.removeAttribute('target');
-    var href = a.getAttribute('href');
-    if (!href) return;
-    try {
-      var u = new URL(a.href, window.location.href);
-      if ((u.hostname === 'www.youtube.com' || u.hostname === 'youtube.com') && !a.href.startsWith(WORKER)) {
-        e.preventDefault();
-        e.stopPropagation();
-        window.location.href = WORKER + u.pathname + u.search + u.hash;
-      }
-    } catch(_) {}
-  }, true);
-})();
-<\/script>
-<style>
-  /* FIX 3: Hide mouse cursor — TV is remote-controlled, no pointer needed.
-     Using !important on every element overrides any YouTube TV inline style
-     or specificity that might re-show the cursor on hover. */
-  *, *::before, *::after { cursor: none !important; }
-</style>`;
+      // NOTE: The injected script must be pure ES5 — Vewd browser on TitanOS
+      // uses a Chromium ~60 engine (c.2019) which lacks full Proxy support.
+      // No Proxy, no optional chaining, no nullish coalescing, no template
+      // literals inside the serialised string — use string concatenation only.
+      const inlineInterceptor = '<script>\n' +
+'(function(){\n' +
+'  var WORKER = ' + JSON.stringify(WORKER_ORIGIN) + ';\n' +
+'  var GOOGLE_RE = new RegExp(' + JSON.stringify(GOOGLE_RE_SRC) + ');\n' +
+'\n' +
+'  // FIX 1: ES5-safe location spoof.\n' +
+'  // YouTube TV checks location.hostname to decide whether to show the\n' +
+'  // "NO DEBUG ACCESS" red banner. We replace window.location with a plain\n' +
+'  // frozen object that reports www.youtube.com for hostname/host/origin\n' +
+'  // while keeping the real href/assign/replace for actual navigation.\n' +
+'  // We do NOT use Proxy because Vewd (Chromium 60, 2019) crashes on it.\n' +
+'  try {\n' +
+'    var _rl = window.location;\n' +
+'    var _fakeLocation = {\n' +
+'      hostname : "www.youtube.com",\n' +
+'      host     : "www.youtube.com",\n' +
+'      origin   : "https://www.youtube.com",\n' +
+'      protocol : "https:",\n' +
+'      port     : "",\n' +
+'      pathname : _rl.pathname,\n' +
+'      search   : _rl.search,\n' +
+'      hash     : _rl.hash,\n' +
+'      href     : _rl.href.replace(WORKER, "https://www.youtube.com"),\n' +
+'      assign   : function(u) { _rl.assign(u); },\n' +
+'      replace  : function(u) { _rl.replace(u); },\n' +
+'      reload   : function()  { _rl.reload(); },\n' +
+'      toString : function()  { return _fakeLocation.href; }\n' +
+'    };\n' +
+'    Object.defineProperty(window, "location", {\n' +
+'      get: function() { return _fakeLocation; },\n' +
+'      configurable: true\n' +
+'    });\n' +
+'  } catch(e) { console.warn("[titanos] location spoof failed:", e); }\n' +
+'\n' +
+'  function isGoogleHost(u) {\n' +
+'    try { return GOOGLE_RE.test(new URL(u).hostname); } catch(e) { return false; }\n' +
+'  }\n' +
+'\n' +
+'  function rewriteGV(u) {\n' +
+'    if (typeof u !== "string" || !isGoogleHost(u)) return u;\n' +
+'    var host = new URL(u).hostname;\n' +
+'    if (u.indexOf(WORKER) === 0) return u;\n' +
+'    return u.replace(/https?:\\/\\/[^\\/?#]+/, WORKER + "/__proxy/" + host);\n' +
+'  }\n' +
+'\n' +
+'  function rewriteUrl(u) {\n' +
+'    if (typeof u !== "string") return u;\n' +
+'    if (u.indexOf(WORKER) === 0) return u;\n' +
+'    try {\n' +
+'      var parsed = new URL(u, window.location.href);\n' +
+'      if (parsed.hostname === "www.youtube.com" || parsed.hostname === "youtube.com") {\n' +
+'        return WORKER + parsed.pathname + parsed.search + parsed.hash;\n' +
+'      }\n' +
+'    } catch(e) {}\n' +
+'    return u;\n' +
+'  }\n' +
+'\n' +
+'  // Patch fetch\n' +
+'  var _fetch = window.fetch;\n' +
+'  window.fetch = function(input, init) {\n' +
+'    var u = (typeof input === "string") ? input : (input && input.url) || "";\n' +
+'    var rw = rewriteGV(u);\n' +
+'    if (rw !== u) {\n' +
+'      if (typeof input === "string") input = rw;\n' +
+'      else if (input && input.url) input = new Request(rw, input);\n' +
+'    }\n' +
+'    return _fetch.call(this, input, init);\n' +
+'  };\n' +
+'\n' +
+'  // Patch XHR\n' +
+'  var _open = XMLHttpRequest.prototype.open;\n' +
+'  XMLHttpRequest.prototype.open = function(method, u) {\n' +
+'    return _open.apply(this, [method, rewriteGV(u)].concat(\n' +
+'      Array.prototype.slice.call(arguments, 2)\n' +
+'    ));\n' +
+'  };\n' +
+'\n' +
+'  // FIX 2: Block about:blank / empty window.open calls.\n' +
+'  // YouTube TV opens a blank tab as step 1 of video navigation.\n' +
+'  // On Vewd (single-tab) this destroys the session. Return null.\n' +
+'  var _winOpen = window.open;\n' +
+'  window.open = function(u, target, features) {\n' +
+'    if (!u || u === "about:blank" || u === "about:newtab" || u === "") return null;\n' +
+'    u = rewriteUrl(u);\n' +
+'    if (target === "_self" || target === "_top" || target === "_parent") {\n' +
+'      return _winOpen.call(window, u, target, features);\n' +
+'    }\n' +
+'    window.location.href = u;\n' +
+'    return null;\n' +
+'  };\n' +
+'\n' +
+'  // Strip target="_blank" from dynamically injected anchors\n' +
+'  var _mo = new MutationObserver(function(mutations) {\n' +
+'    for (var i = 0; i < mutations.length; i++) {\n' +
+'      var nodes = mutations[i].addedNodes;\n' +
+'      for (var j = 0; j < nodes.length; j++) {\n' +
+'        var node = nodes[j];\n' +
+'        if (node.nodeType !== 1) continue;\n' +
+'        if (node.tagName === "A" && node.target) node.removeAttribute("target");\n' +
+'        var anchors = node.querySelectorAll ? node.querySelectorAll("a[target]") : [];\n' +
+'        for (var k = 0; k < anchors.length; k++) anchors[k].removeAttribute("target");\n' +
+'      }\n' +
+'    }\n' +
+'  });\n' +
+'  _mo.observe(document.documentElement || document, { childList: true, subtree: true });\n' +
+'\n' +
+'  // Click capture — rewrite cross-origin YouTube links via Worker\n' +
+'  document.addEventListener("click", function(e) {\n' +
+'    var a = e.target && e.target.closest ? e.target.closest("a") : null;\n' +
+'    if (!a) return;\n' +
+'    var t = a.getAttribute("target");\n' +
+'    if (t && (t === "_blank" || t === "_new")) a.removeAttribute("target");\n' +
+'    var href = a.getAttribute("href");\n' +
+'    if (!href) return;\n' +
+'    try {\n' +
+'      var parsed = new URL(a.href, window.location.href);\n' +
+'      if ((parsed.hostname === "www.youtube.com" || parsed.hostname === "youtube.com")\n' +
+'          && a.href.indexOf(WORKER) !== 0) {\n' +
+'        e.preventDefault();\n' +
+'        e.stopPropagation();\n' +
+'        window.location.href = WORKER + parsed.pathname + parsed.search + parsed.hash;\n' +
+'      }\n' +
+'    } catch(err) {}\n' +
+'  }, true);\n' +
+'})();\n' +
+'<\/script>\n' +
+'<style>\n' +
+'  /* FIX 3: Hide cursor — TV uses remote, no mouse needed */\n' +
+'  *, *::before, *::after { cursor: none !important; }\n' +
+'<\/style>';
 
       html = html.replace('<head>', '<head>' + inlineInterceptor + '<script src="/index.js?v=9"><\/script>');
 
