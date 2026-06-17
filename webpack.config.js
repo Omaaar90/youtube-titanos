@@ -18,6 +18,7 @@ const makeConfig = (env, argv) => {
     output: {
       path: path.resolve(__dirname, 'dist'),
       filename: 'index.js',
+      chunkFilename: '[name].index.js?v=9',
       clean: true,
     },
     resolve: {

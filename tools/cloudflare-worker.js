@@ -239,7 +239,7 @@ async function handleRequest(request, env, ctx) {
       url.pathname.endsWith('.css') ||
       url.pathname.endsWith('.js.map')
     ) {
-      const res = await fetch(`${GH_PAGES_BASE}${url.pathname}`);
+      const res = await fetch(`${GH_PAGES_BASE}${url.pathname}${url.search}`);
       const h = new Headers(res.headers);
       for (const [k, v] of Object.entries(CORS)) h.set(k, v);
       return new Response(res.body, { status: res.status, headers: h });
@@ -431,7 +431,7 @@ self.addEventListener('fetch', function(event) {
 })();
 <\/script>`;
       // Add version query parameter to script source to force the TV browser to bypass local JS cache
-      html = html.replace('<head>', '<head>' + inlineInterceptor + '<script src="/index.js?v=8"></script>');
+      html = html.replace('<head>', '<head>' + inlineInterceptor + '<script src="/index.js?v=9"></script>');
 
       // Rewrite static host URLs
       html = rewriteHosts(html, WORKER_ORIGIN);
