@@ -201,9 +201,17 @@ async function handleRequest(request, env, ctx) {
         try {
           // Decode body text to inspect and rewrite client credentials on-the-fly
           let bodyText = new TextDecoder().decode(reqBody);
-          // Swapping YouTube TV's blocked profile 1 client ID with fully permitted profile 0 client ID
-          bodyText = bodyText.replace('861556708454-912i5jlic99ecvu3ro5kqirg0hldli5t.apps.googleusercontent.com', '861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com');
-          bodyText = bodyText.replace('ju2WuMJMOjilz_h_1dPgFdeU', 'SboVhoG9s0rNafixCSGGKXAT');
+          
+          // Support custom Client ID / Secret via Cloudflare Worker environment variables,
+          // falling back to Google's permitted Profile 0 TV client ID/secret.
+          const targetClientId = env.CUSTOM_CLIENT_ID || '861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com';
+          const targetClientSecret = env.CUSTOM_CLIENT_SECRET || 'SboVhoG9s0rNafixCSGGKXAT';
+          
+          bodyText = bodyText.replace('861556708454-912i5jlic99ecvu3ro5kqirg0hldli5t.apps.googleusercontent.com', targetClientId);
+          bodyText = bodyText.replace('861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com', targetClientId);
+          bodyText = bodyText.replace('ju2WuMJMOjilz_h_1dPgFdeU', targetClientSecret);
+          bodyText = bodyText.replace('SboVhoG9s0rNafixCSGGKXAT', targetClientSecret);
+          
           reqBody = new TextEncoder().encode(bodyText);
         } catch (e) {
           console.error('[OAuth] Failed to rewrite credentials in request body:', e.message);
@@ -345,7 +353,8 @@ self.addEventListener('fetch', function(event) {
   } catch(e) {}
 })();
 <\/script>`;
-      html = html.replace('<head>', '<head>' + inlineInterceptor + '<script src="/index.js"></script>');
+      // Add version query parameter to script source to force the TV browser to bypass local JS cache
+      html = html.replace('<head>', '<head>' + inlineInterceptor + '<script src="/index.js?v=5"></script>');
 
       // Rewrite static host URLs
       html = rewriteHosts(html);
@@ -363,7 +372,11 @@ self.addEventListener('fetch', function(event) {
       h.delete('x-frame-options');
       h.delete('content-encoding');
       h.delete('transfer-encoding');
+      h.delete('etag');
+      h.delete('last-modified');
       h.set('content-type', 'text/html; charset=utf-8');
+      // Force the TV browser to never cache the bootstrap page
+      h.set('cache-control', 'no-store, no-cache, must-revalidate, max-age=0');
       for (const [k, v] of Object.entries(CORS)) h.set(k, v);
 
       return new Response(html, { status: res.status, headers: h });
@@ -400,16 +413,8 @@ self.addEventListener('fetch', function(event) {
 
       cleanRequestHeaders(reqHeaders);
 
-      if (request.headers.has('origin')) {
-        reqHeaders.set('origin', 'https://www.youtube.com');
-      } else {
-        reqHeaders.delete('origin');
-      }
-      if (request.headers.has('referer')) {
-        reqHeaders.set('referer', 'https://www.youtube.com/tv');
-      } else {
-        reqHeaders.delete('referer');
-      }
+      reqHeaders.set('origin', 'https://www.youtube.com');
+      reqHeaders.set('referer', 'https://www.youtube.com/tv');
 
       const res = await fetch(`https://${upHost}${upPath}${url.search}`, {
         method: request.method,
@@ -465,16 +470,8 @@ self.addEventListener('fetch', function(event) {
 
     cleanRequestHeaders(reqHeaders);
 
-    if (request.headers.has('origin')) {
-      reqHeaders.set('origin', 'https://www.youtube.com');
-    } else {
-      reqHeaders.delete('origin');
-    }
-    if (request.headers.has('referer')) {
-      reqHeaders.set('referer', 'https://www.youtube.com/tv');
-    } else {
-      reqHeaders.delete('referer');
-    }
+    reqHeaders.set('origin', 'https://www.youtube.com');
+    reqHeaders.set('referer', 'https://www.youtube.com/tv');
 
     const res = await fetch(targetUrl.toString(), {
       method: request.method,
