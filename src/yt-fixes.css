@@ -1,3 +1,6 @@
+/* Hide mouse cursor — TV remote navigation only, no pointer needed */
+*, *::before, *::after { cursor: none !important; }
+
 /* Fixes transparency effect for the video player */
 .ytLrWatchDefaultShadow {
   display: block !important;

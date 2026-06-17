@@ -6,6 +6,62 @@ let searchHistoryObserver = null;
 export function initYouTubeFixes() {
     console.log('[YT-Fixes] Initializing...');
     initSearchHistoryFix();
+    initLinkFix();
+}
+
+/**
+ * Prevent YouTube TV from opening new tabs via target="_blank" links or
+ * window.open() calls. On a TV browser there is typically only one tab —
+ * opening a new one navigates away from the app and leaves a broken session.
+ *
+ * Strategy:
+ *  1. Capture-phase click listener: strip target="_blank" before the browser
+ *     acts on it, then let the click propagate normally (YouTube's own handler
+ *     will navigate within the same frame via its router).
+ *  2. Patch window.open(): route any call to same-tab navigation instead.
+ */
+function initLinkFix() {
+    // 1. Intercept link clicks at the capture phase (runs before YouTube's handlers)
+    document.addEventListener('click', (e) => {
+        const anchor = e.target.closest('a[target]');
+        if (!anchor) return;
+        const target = anchor.getAttribute('target');
+        if (target === '_blank' || target === '_new') {
+            anchor.removeAttribute('target');
+            // If the href is a full YouTube URL, extract the path so the
+            // leanback router can handle it without a hard navigation.
+            const href = anchor.href;
+            if (href && href.includes('youtube.com')) {
+                try {
+                    const url = new URL(href);
+                    // Only rewrite to same origin to avoid open-redirect issues
+                    if (url.origin === location.origin) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        window.location.href = href;
+                    }
+                    // else: let it fall through as same-tab now (target removed)
+                } catch (_) { /* not a valid URL, leave as-is */ }
+            }
+        }
+    }, true /* capture */);
+
+    // 2. Block window.open() — YouTube TV rarely uses this, but just in case
+    const _open = window.open.bind(window);
+    window.open = function(url, target, features) {
+        // Allow same-tab/same-frame targets
+        if (!target || target === '_self' || target === '_top' || target === '_parent') {
+            return _open(url, target, features);
+        }
+        // Redirect new-window/new-tab calls to same-tab navigation
+        if (url) {
+            console.log('[YT-Fixes] Intercepted window.open(), redirecting same-tab:', url);
+            window.location.href = url;
+        }
+        return null;
+    };
+
+    console.log('[YT-Fixes] Link/new-tab fix active.');
 }
 
 export function cleanupYouTubeFixes() {

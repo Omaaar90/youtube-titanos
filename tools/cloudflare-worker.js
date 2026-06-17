@@ -284,7 +284,22 @@ self.addEventListener('fetch', function(event) {
     }
 
     // ── 2. YouTube TV HTML — inject bundle + strip security headers ────────
-    if (url.pathname === '/' || url.pathname === '/tv' || url.pathname.startsWith('/tv/')) {
+    // Route 2 covers every YouTube path the TV app can navigate to.
+    // Without this, clicking a video sends the TV browser to youtube.com/watch
+    // directly — bypassing the proxy and showing a broken / home page.
+    const isYTPage =
+      url.pathname === '/' ||
+      url.pathname === '/tv' ||
+      url.pathname.startsWith('/tv/') ||
+      url.pathname.startsWith('/watch') ||
+      url.pathname.startsWith('/shorts/') ||
+      url.pathname.startsWith('/feed/') ||
+      url.pathname.startsWith('/results') ||
+      url.pathname.startsWith('/playlist') ||
+      url.pathname.startsWith('/channel/') ||
+      url.pathname.startsWith('/c/') ||
+      url.pathname.startsWith('/@');
+    if (isYTPage) {
       const ytUrl = new URL('https://www.youtube.com/tv');
       url.searchParams.forEach((v, k) => ytUrl.searchParams.set(k, v));
 
@@ -343,11 +358,6 @@ self.addEventListener('fetch', function(event) {
   };
 
   // ── Patch XHR constructor (catches cached references taken before this) ──
-  // The YouTube player stores: var XHR = window.XMLHttpRequest; early on.
-  // Overriding the global constructor makes those cached refs go through our
-  // patched prototype because they still share the same prototype chain.
-  // Additional safety: wrap the constructor so any 'new XHR()' call from a
-  // captured reference gets an object whose prototype.open is already patched.
   try {
     var _NativeXHR = window.XMLHttpRequest;
     var _PatchedXHR = function() { return new _NativeXHR(); };
@@ -357,10 +367,55 @@ self.addEventListener('fetch', function(event) {
       configurable: true,
     });
   } catch(e) {}
+
+  // ── Block new-tab navigation (TV browser fix) ─────────────────────────────
+  var _winOpen = window.open.bind(window);
+  window.open = function(url, target, features) {
+    if (!target || target === '_self' || target === '_top' || target === '_parent') {
+      return _winOpen(url, target, features);
+    }
+    if (url) { window.location.href = url; }
+    return null;
+  };
+
+  var _mo = new MutationObserver(function(mutations) {
+    for (var i = 0; i < mutations.length; i++) {
+      var nodes = mutations[i].addedNodes;
+      for (var j = 0; j < nodes.length; j++) {
+        var node = nodes[j];
+        if (node.nodeType !== 1) continue;
+        if (node.tagName === 'A' && node.target) node.removeAttribute('target');
+        var anchors = node.querySelectorAll ? node.querySelectorAll('a[target]') : [];
+        for (var k = 0; k < anchors.length; k++) anchors[k].removeAttribute('target');
+      }
+    }
+  });
+  _mo.observe(document.documentElement || document, { childList: true, subtree: true });
+
+  document.addEventListener('click', function(e) {
+    var a = e.target && e.target.closest ? e.target.closest('a[target]') : null;
+    if (!a) return;
+    var t = a.getAttribute('target');
+    if (t === '_blank' || t === '_new') {
+      a.removeAttribute('target');
+      var href = a.href;
+      if (href && href.includes('youtube.com') && !href.startsWith(WORKER)) {
+        try {
+          var u = new URL(href);
+          if (u.origin === 'https://www.youtube.com') {
+            e.preventDefault();
+            e.stopPropagation();
+            window.location.href = WORKER + u.pathname + u.search + u.hash;
+            return;
+          }
+        } catch(_) {}
+      }
+    }
+  }, true);
 })();
 <\/script>`;
       // Add version query parameter to script source to force the TV browser to bypass local JS cache
-      html = html.replace('<head>', '<head>' + inlineInterceptor + '<script src="/index.js?v=5"></script>');
+      html = html.replace('<head>', '<head>' + inlineInterceptor + '<script src="/index.js?v=6"></script>');
 
       // Rewrite static host URLs
       html = rewriteHosts(html);
