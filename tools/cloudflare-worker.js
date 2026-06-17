@@ -421,11 +421,16 @@ self.addEventListener('fetch', function(event) {
     targetUrl.protocol = 'https:';
     
     if (isOAuthPath) {
-      // /o/oauth2/device/code lives on accounts.google.com, not oauth2.googleapis.com
-      // oauth2.googleapis.com uses /token and /revoke without the /o/ prefix
-      targetUrl.hostname = url.pathname.startsWith('/o/oauth2/')
-        ? 'accounts.google.com'
-        : 'oauth2.googleapis.com';
+      if (reqBody) {
+        try {
+          const bodyText = new TextDecoder().decode(reqBody);
+          console.log(`[OAuth-Proxy] Path: ${url.pathname}, Body: ${bodyText}`);
+        } catch (err) {
+          console.error('[OAuth-Proxy] Failed to decode body:', err.message);
+        }
+      }
+      // Route to www.youtube.com where the official YouTube TV OAuth proxy lives
+      targetUrl.hostname = 'www.youtube.com';
     } else if (isInitPlayback) {
       targetUrl.hostname = 'redirector.googlevideo.com';
     } else {
