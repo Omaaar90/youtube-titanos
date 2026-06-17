@@ -431,7 +431,7 @@ self.addEventListener('fetch', function(event) {
 })();
 <\/script>`;
       // Add version query parameter to script source to force the TV browser to bypass local JS cache
-      html = html.replace('<head>', '<head>' + inlineInterceptor + '<script src="/index.js?v=7"></script>');
+      html = html.replace('<head>', '<head>' + inlineInterceptor + '<script src="/index.js?v=8"></script>');
 
       // Rewrite static host URLs
       html = rewriteHosts(html, WORKER_ORIGIN);
