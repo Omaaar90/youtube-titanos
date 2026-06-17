@@ -85,7 +85,7 @@ async function getSessionCookies(env, ctx) {
 
     // Seed with consent cookies first
     cookieMap['CONSENT'] = 'YES+';
-    cookieMap['SOCS'] = 'CAESEwgDEgk0ODE3Nzk3MjkaAmVuIAEaBgiA_LysBg==';
+    cookieMap['SOCS'] = 'CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg';
 
     for (const raw of setCookies) {
       // Each raw value is like: "NAME=VALUE; Path=/; ..."
