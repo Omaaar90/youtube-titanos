@@ -17,7 +17,7 @@ const SESSION_TTL = 60 * 60; // refresh session every 1 hour
 // Single source-of-truth for every Google/YouTube domain family we proxy.
 // Covers: video CDN, YouTube CDN edge, images, avatars, static assets,
 // APIs, OAuth, ads. Add new TLDs here and they flow everywhere automatically.
-const GOOGLE_FAMILY_RE = /(?:googlevideo|ytimg|ggpht|gstatic|googleapis|doubleclick)\.com$|(?:^|\.)(?:youtube|google|accounts\.google)\.com$/;
+const GOOGLE_FAMILY_RE = /(?:googlevideo|ytimg|ggpht|gstatic|googleapis)\.com$|doubleclick\.(?:com|net)$|(?:^|\.)(?:youtube|google|accounts\.google)\.com$/;
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -33,7 +33,7 @@ const CORS = {
 // are not navigable URLs and rewriting them would corrupt the data.
 function rewriteHosts(text) {
   return text.replace(
-    /https?:\/\/([a-z0-9][a-z0-9\-\.]*\.(?:googlevideo|ytimg|ggpht|gstatic|googleapis|doubleclick)\.com|(?:[a-z0-9][a-z0-9\-]*\.)*(?:youtube|google)\.com)/g,
+    /https?:\/\/([a-z0-9][a-z0-9\-\.]*\.(?:googlevideo|ytimg|ggpht|gstatic|googleapis)\.com|[a-z0-9][a-z0-9\-\.]*\.doubleclick\.(?:com|net)|(?:[a-z0-9][a-z0-9\-]*\.)*(?:youtube|google)\.com)/g,
     (match, host) => {
       // Don't rewrite www.youtube.com — main page handled by route 2 directly.
       if (host === 'www.youtube.com') return match;
@@ -191,6 +191,11 @@ async function handleRequest(request, env, ctx) {
       return new Response(null, { status: 204, headers: CORS });
     }
 
+    // Read body into memory to ensure it is forwarded correctly (avoids streaming issues in Worker fetch)
+    const reqBody = request.method !== 'GET' && request.method !== 'HEAD'
+      ? await request.arrayBuffer()
+      : undefined;
+
     // Get (or bootstrap) session cookies — pass ctx so KV write can be
     // deferred via ctx.waitUntil() without blocking the response.
     const sessionCookies = await getSessionCookies(env, ctx);
@@ -214,7 +219,7 @@ async function handleRequest(request, env, ctx) {
       // GOOGLE_RE: matches every Google/YouTube CDN host family in one pattern.
       // Written as a string so it survives the template-literal → JS serialisation
       // without backslash mangling (same trick as the inline interceptor below).
-      const GOOGLE_RE_SRC = String.raw`(?:googlevideo|ytimg|ggpht|gstatic|googleapis|doubleclick)\.com$|(?:^|\.)(?:youtube|google)\.com$`;
+      const GOOGLE_RE_SRC = String.raw`(?:googlevideo|ytimg|ggpht|gstatic|googleapis)\.com$|doubleclick\.(?:com|net)$|(?:^|\.)(?:youtube|google)\.com$`;
       const swCode = `
 'use strict';
 var GOOGLE_RE = new RegExp(${JSON.stringify(GOOGLE_RE_SRC)});
@@ -270,7 +275,7 @@ self.addEventListener('fetch', function(event) {
       const WORKER_ORIGIN = url.origin;
       // GOOGLE_RE_SRC: serialised as a JSON string so backslashes survive the
       // template-literal → HTML → JS parser chain without double-evaluation.
-      const GOOGLE_RE_SRC = String.raw`(?:googlevideo|ytimg|ggpht|gstatic|googleapis|doubleclick)\.com$|(?:^|\.)(?:youtube|google)\.com$`;
+      const GOOGLE_RE_SRC = String.raw`(?:googlevideo|ytimg|ggpht|gstatic|googleapis)\.com$|doubleclick\.(?:com|net)$|(?:^|\.)(?:youtube|google)\.com$`;
       const inlineInterceptor = `<script>
 (function(){
   var WORKER = ${JSON.stringify(WORKER_ORIGIN)};
@@ -394,7 +399,7 @@ self.addEventListener('fetch', function(event) {
       const res = await fetch(`https://${upHost}${upPath}${url.search}`, {
         method: request.method,
         headers: reqHeaders,
-        body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : undefined,
+        body: reqBody,
         redirect: 'follow',
       });
 
@@ -454,7 +459,7 @@ self.addEventListener('fetch', function(event) {
     const res = await fetch(targetUrl.toString(), {
       method: request.method,
       headers: reqHeaders,
-      body: request.method !== 'GET' && request.method !== 'HEAD' ? request.body : undefined,
+      body: reqBody,
       redirect: 'follow',
     });
 
