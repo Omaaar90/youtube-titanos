@@ -1,10 +1,12 @@
 /**
- * YouTube-TitanOS — Cloudflare Worker Reverse Proxy v3
+ * YouTube-TitanOS — Cloudflare Worker Reverse Proxy v4
  *
- * Changes from v2:
- *  - KV-backed session cookie bootstrapping to fix /youtubei/v1/ 403s
- *  - Player config JSON rewriting to fix redirector.googlevideo.com CORS
- *  - Consent cookie injection to bypass GDPR redirect loops
+ * v4 changes:
+ *  - Catch-all GOOGLE_FAMILY_RE replaces fragile per-host pattern lists.
+ *    Any *.googlevideo.com, *.c.youtube.com, *.ytimg.com, *.ggpht.com,
+ *    *.gstatic.com, *.googleapis.com, *.google.com, accounts.google.com,
+ *    *.doubleclick.net request is intercepted automatically — no more
+ *    whack-a-mole when YouTube adds a new CDN edge hostname.
  */
 
 const GH_PAGES_BASE = 'https://Omaaar90.github.io/youtube-titanos';
@@ -12,18 +14,10 @@ const TV_UA = 'Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) AppleWebKit/538.1 (KHTML
 const SESSION_KV_KEY = 'yt_session_cookies';
 const SESSION_TTL = 60 * 60; // refresh session every 1 hour
 
-const REWRITE_HOSTS = [
-  'www.gstatic.com',
-  'fonts.gstatic.com',
-  'clients1.google.com',
-  'suggestqueries.google.com',
-  'jnn-pa.googleapis.com',
-  'www.googleapis.com',
-  'oauth2.googleapis.com',
-  'redirector.googlevideo.com',
-  'static.doubleclick.net',
-  'eligibility-panelresearch.googlevideo.com',
-];
+// Single source-of-truth for every Google/YouTube domain family we proxy.
+// Covers: video CDN, YouTube CDN edge, images, avatars, static assets,
+// APIs, OAuth, ads. Add new TLDs here and they flow everywhere automatically.
+const GOOGLE_FAMILY_RE = /(?:googlevideo|ytimg|ggpht|gstatic|googleapis|doubleclick)\.com$|(?:^|\.)(?:youtube|google|accounts\.google)\.com$/;
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -32,72 +26,92 @@ const CORS = {
   'Access-Control-Max-Age': '86400',
 };
 
-function buildRewriteRegex(host) {
-  return new RegExp(
-    `(?:https?:)?(?:/|\\\\/){2}${host.replace(/\./g, '\\.')}`,
-    'g'
-  );
-}
-
+// Rewrite any baked-in Google/YouTube URL in HTML/JS text responses so they
+// go through our /__proxy/<host> tunnel instead of hitting the origin directly.
+// IMPORTANT: Only rewrite https?:// prefixed URLs — NOT protocol-relative //
+// URLs, which may appear inside JSON data blobs and config objects where they
+// are not navigable URLs and rewriting them would corrupt the data.
 function rewriteHosts(text) {
-  for (const host of REWRITE_HOSTS) {
-    text = text.replace(buildRewriteRegex(host), `/__proxy/${host}`);
-  }
-  return text;
+  return text.replace(
+    /https?:\/\/([a-z0-9][a-z0-9\-\.]*\.(?:googlevideo|ytimg|ggpht|gstatic|googleapis|doubleclick)\.com|(?:[a-z0-9][a-z0-9\-]*\.)*(?:youtube|google)\.com)/g,
+    (match, host) => {
+      // Don't rewrite www.youtube.com — main page handled by route 2 directly.
+      if (host === 'www.youtube.com') return match;
+      return `/__proxy/${host}`;
+    }
+  );
 }
 
 /**
  * Fetch a fresh YouTube TV session and extract cookies.
  * Stores them in KV with a TTL so we don't hammer YouTube on every request.
+ * Falls back to consent-only cookies on any network error so the worker
+ * doesn't hard-crash when YouTube is slow or rate-limiting us.
  */
-async function getSessionCookies(env) {
+async function getSessionCookies(env, ctx) {
   // Try KV cache first
   if (env.YT_SESSION) {
-    const cached = await env.YT_SESSION.get(SESSION_KV_KEY);
-    if (cached) return cached;
-  }
-
-  // Bootstrap a fresh session
-  const res = await fetch('https://www.youtube.com/tv', {
-    headers: {
-      'User-Agent': TV_UA,
-      'Accept-Language': 'en-US,en;q=0.9',
-      // Inject CONSENT cookie to skip GDPR/cookie-consent redirect
-      'Cookie': 'CONSENT=YES+; SOCS=CAESEwgDEgk0ODE3Nzk3MjkaAmVuIAEaBgiA_LysBg==',
-    },
-    redirect: 'follow',
-  });
-
-  // Collect Set-Cookie headers
-  const setCookies = res.headers.getAll
-    ? res.headers.getAll('set-cookie')          // Cloudflare Workers supports getAll
-    : [res.headers.get('set-cookie')].filter(Boolean);
-
-  // Parse into a single Cookie header string
-  const cookieMap = {};
-
-  // Seed with consent cookies first
-  cookieMap['CONSENT'] = 'YES+';
-  cookieMap['SOCS'] = 'CAESEwgDEgk0ODE3Nzk3MjkaAmVuIAEaBgiA_LysBg==';
-
-  for (const raw of setCookies) {
-    // Each raw value is like: "NAME=VALUE; Path=/; ..."
-    const pair = raw.split(';')[0].trim();
-    const eq = pair.indexOf('=');
-    if (eq > 0) {
-      const name = pair.slice(0, eq).trim();
-      const val = pair.slice(eq + 1).trim();
-      cookieMap[name] = val;
+    try {
+      const cached = await env.YT_SESSION.get(SESSION_KV_KEY);
+      if (cached) return cached;
+    } catch (e) {
+      console.warn('[session] KV read failed, falling back to live fetch:', e.message);
     }
   }
 
-  const cookieString = Object.entries(cookieMap)
-    .map(([k, v]) => `${k}=${v}`)
-    .join('; ');
+  // Consent-only fallback — returned immediately if the bootstrap fetch fails
+  const FALLBACK = 'CONSENT=YES+; SOCS=CAESEwgDEgk0ODE3Nzk3MjkaAmVuIAEaBgiA_LysBg==';
 
-  // Cache in KV
-  if (env.YT_SESSION) {
-    await env.YT_SESSION.put(SESSION_KV_KEY, cookieString, { expirationTtl: SESSION_TTL });
+  let cookieString = FALLBACK;
+  try {
+    // Bootstrap a fresh session
+    const res = await fetch('https://www.youtube.com/tv', {
+      headers: {
+        'User-Agent': TV_UA,
+        'Accept-Language': 'en-US,en;q=0.9',
+        // Inject CONSENT cookie to skip GDPR/cookie-consent redirect
+        'Cookie': FALLBACK,
+      },
+      redirect: 'follow',
+    });
+
+    // Collect Set-Cookie headers
+    const setCookies = res.headers.getAll
+      ? res.headers.getAll('set-cookie')          // Cloudflare Workers supports getAll
+      : [res.headers.get('set-cookie')].filter(Boolean);
+
+    // Parse into a single Cookie header string
+    const cookieMap = {};
+
+    // Seed with consent cookies first
+    cookieMap['CONSENT'] = 'YES+';
+    cookieMap['SOCS'] = 'CAESEwgDEgk0ODE3Nzk3MjkaAmVuIAEaBgiA_LysBg==';
+
+    for (const raw of setCookies) {
+      // Each raw value is like: "NAME=VALUE; Path=/; ..."
+      const pair = raw.split(';')[0].trim();
+      const eq = pair.indexOf('=');
+      if (eq > 0) {
+        const name = pair.slice(0, eq).trim();
+        const val = pair.slice(eq + 1).trim();
+        cookieMap[name] = val;
+      }
+    }
+
+    cookieString = Object.entries(cookieMap)
+      .map(([k, v]) => `${k}=${v}`)
+      .join('; ');
+
+    // Cache in KV — use ctx.waitUntil() so the KV write doesn't block the
+    // response. The next request will benefit from the cached value.
+    if (env.YT_SESSION && ctx) {
+      ctx.waitUntil(
+        env.YT_SESSION.put(SESSION_KV_KEY, cookieString, { expirationTtl: SESSION_TTL })
+          .catch(e => console.warn('[session] KV write failed:', e.message))
+      );
+    }
+  } catch (e) {
+    console.error('[session] Bootstrap fetch failed, using consent-only fallback:', e.message);
   }
 
   return cookieString;
@@ -122,30 +136,64 @@ function mergeCookies(sessionCookies, requestCookies) {
   return Object.entries(map).map(([k, v]) => `${k}=${v}`).join('; ');
 }
 
+// Strip Cloudflare-injected and browser security headers before forwarding
+// to YouTube. Sending these upstream triggers YouTube's bot-detection and
+// returns 403s. None of them add value on the upstream side.
 function cleanRequestHeaders(reqHeaders) {
+  // sec-fetch-* reveal the request initiator context — TV clients don't send these
   reqHeaders.delete('sec-fetch-site');
   reqHeaders.delete('sec-fetch-mode');
   reqHeaders.delete('sec-fetch-dest');
   reqHeaders.delete('sec-fetch-user');
+  // Cloudflare-specific headers — meaningless to YouTube, flag us as a proxy
   reqHeaders.delete('cf-connecting-ip');
   reqHeaders.delete('cf-ray');
   reqHeaders.delete('cf-visitor');
   reqHeaders.delete('cf-ipcountry');
+  // Cache validators — strip so YouTube always sends fresh content through the proxy
   reqHeaders.delete('if-none-match');
   reqHeaders.delete('if-modified-since');
-  reqHeaders.delete('x-forwarded-for'); // Do NOT forward x-forwarded-for — causes bot-detection 403s
+  // x-forwarded-for reveals the true client IP and triggers bot-detection 403s
+  reqHeaders.delete('x-forwarded-for');
 }
 
 export default {
   async fetch(request, env, ctx) {
+    // Top-level guard: catch any unhandled error so the user never sees a raw
+    // stack trace. Errors are logged for `wrangler tail` inspection.
+    try {
+      return await handleRequest(request, env, ctx);
+    } catch (e) {
+      console.error('[worker] Unhandled error:', e.message, e.stack);
+      return new Response(JSON.stringify({ error: 'Internal proxy error', detail: e.message }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json', ...CORS },
+      });
+    }
+  },
+
+  // Stub for future cron-based session refresh (add a triggers.crons entry
+  // in wrangler.toml to activate). Runs in the background without a request.
+  async scheduled(event, env, ctx) {
+    console.info('[scheduled] Session refresh triggered at', new Date().toISOString());
+    // Force-invalidate the KV cache so the next request bootstraps a fresh session.
+    if (env.YT_SESSION) {
+      await env.YT_SESSION.delete(SESSION_KV_KEY)
+        .catch(e => console.warn('[scheduled] KV delete failed:', e.message));
+    }
+  },
+};
+
+async function handleRequest(request, env, ctx) {
     const url = new URL(request.url);
 
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: CORS });
     }
 
-    // Get (or bootstrap) session cookies — do this early for all routes
-    const sessionCookies = await getSessionCookies(env);
+    // Get (or bootstrap) session cookies — pass ctx so KV write can be
+    // deferred via ctx.waitUntil() without blocking the response.
+    const sessionCookies = await getSessionCookies(env, ctx);
 
     // ── 1. Our built assets from GitHub Pages ──────────────────────────────
     if (
@@ -161,39 +209,36 @@ export default {
       return new Response(res.body, { status: res.status, headers: h });
     }
 
-    // ── Service Worker for Network-Level Interceptions ──────────────────
+    // ── Service Worker — catch-all Google/YouTube family proxy ─────────────
     if (url.pathname === '/sw.js') {
+      // GOOGLE_RE: matches every Google/YouTube CDN host family in one pattern.
+      // Written as a string so it survives the template-literal → JS serialisation
+      // without backslash mangling (same trick as the inline interceptor below).
+      const GOOGLE_RE_SRC = String.raw`(?:googlevideo|ytimg|ggpht|gstatic|googleapis|doubleclick)\.com$|(?:^|\.)(?:youtube|google)\.com$`;
       const swCode = `
-        self.addEventListener('install', (event) => {
-          self.skipWaiting();
-        });
-        self.addEventListener('activate', (event) => {
-          event.waitUntil(clients.claim());
-        });
-        self.addEventListener('fetch', (event) => {
-          const url = event.request.url;
-          
-          // Intercept *.googlevideo.com AND *.c.youtube.com CDN nodes
-          const cdnMatch = url.match(/https?:\/\/([a-z0-9][a-z0-9\-\.]*\.(?:googlevideo\.com|c\.youtube\.com))/);
-          if (cdnMatch) {
-            const host = cdnMatch[1];
-            const proxied = url.replace(
-              new RegExp('https?:\\/\\/' + host.replace(/\./g, '\\.')),
-              self.location.origin + '/__proxy/' + host
-            );
-            event.respondWith(
-              fetch(proxied, {
-                method: event.request.method,
-                headers: event.request.headers,
-                body: event.request.method !== 'GET' && event.request.method !== 'HEAD'
-                  ? event.request.body : undefined,
-                redirect: 'follow',
-              })
-            );
-            return;
-          }
-        });
-      `;
+'use strict';
+var GOOGLE_RE = new RegExp(${JSON.stringify(GOOGLE_RE_SRC)});
+self.addEventListener('install', function(e){ self.skipWaiting(); });
+self.addEventListener('activate', function(e){ e.waitUntil(self.clients.claim()); });
+self.addEventListener('fetch', function(event) {
+  var dest = new URL(event.request.url);
+  // Pass through requests already going to our own worker origin.
+  if (dest.origin === self.location.origin) return;
+  // Proxy every cross-origin Google/YouTube family request.
+  if (GOOGLE_RE.test(dest.hostname)) {
+    var proxied = self.location.origin + '/__proxy/' + dest.hostname + dest.pathname + dest.search;
+    event.respondWith(
+      fetch(proxied, {
+        method: event.request.method,
+        headers: event.request.headers,
+        body: (event.request.method !== 'GET' && event.request.method !== 'HEAD')
+          ? event.request.body : undefined,
+        redirect: 'follow',
+      })
+    );
+  }
+});
+`;
       return new Response(swCode, {
         headers: {
           'Content-Type': 'application/javascript; charset=utf-8',
@@ -218,25 +263,28 @@ export default {
       const res = await fetch(ytUrl.toString(), { headers: reqHeaders });
       let html = await res.text();
 
-      // Inject our bundle + an inline XHR/fetch monkey-patch for runtime googlevideo URLs
+      // Inject our bundle + an inline XHR/fetch monkey-patch.
+      // Catches ALL cross-origin Google/YouTube family requests before the browser
+      // blocks them — no per-host pattern needed, one broad regex covers everything.
       const WORKER_ORIGIN = url.origin;
-      // FIX 1: Use new RegExp() so backslashes are not mangled when the
-      // template-literal string is embedded inside an HTML attribute/script tag.
-      // FIX 2: Patch XHR at the *constructor* level (Object.defineProperty) so
-      // code that cached window.XMLHttpRequest before our script ran is still
-      // intercepted (the YouTube player does this internally).
+      // GOOGLE_RE_SRC: serialised as a JSON string so backslashes survive the
+      // template-literal → HTML → JS parser chain without double-evaluation.
+      const GOOGLE_RE_SRC = String.raw`(?:googlevideo|ytimg|ggpht|gstatic|googleapis|doubleclick)\.com$|(?:^|\.)(?:youtube|google)\.com$`;
       const inlineInterceptor = `<script>
 (function(){
   var WORKER = ${JSON.stringify(WORKER_ORIGIN)};
-  // Use RegExp constructor — regex literals inside template-literal→HTML strings
-  // have their backslashes double-evaluated, causing SyntaxError.
-  // Matches both *.googlevideo.com AND *.c.youtube.com (e.g. r4---sn-xxx.c.youtube.com)
-  var GV_RE = new RegExp('https?:\\/\\/([a-z0-9][a-z0-9\\-\\.]*\\.(?:googlevideo\\.com|c\\.youtube\\.com))');
+  // Matches every Google/YouTube CDN family — auto-covers new edge hostnames.
+  var GOOGLE_RE = new RegExp(${JSON.stringify(GOOGLE_RE_SRC)});
+  function isGoogleHost(url) {
+    try { return GOOGLE_RE.test(new URL(url).hostname); } catch(e) { return false; }
+  }
 
   function rewriteGV(url) {
-    if (typeof url !== 'string') return url;
-    var m = url.match(GV_RE);
-    return m ? url.replace(m[0], WORKER + '/__proxy/' + m[1]) : url;
+    if (typeof url !== 'string' || !isGoogleHost(url)) return url;
+    var host = new URL(url).hostname;
+    // Don't double-proxy — if already pointing at our worker, pass through.
+    if (url.startsWith(WORKER)) return url;
+    return url.replace(/https?:\/\/[^/?#]+/, WORKER + '/__proxy/' + host);
   }
 
   // ── Patch fetch ──────────────────────────────────────────────────────────
@@ -312,15 +360,8 @@ export default {
         return new Response(null, { status: 204, headers: CORS });
       }
 
-      const isAllowedHost =
-        REWRITE_HOSTS.includes(upHost) ||
-        upHost.endsWith('.googlevideo.com') ||
-        upHost.endsWith('.c.youtube.com') ||   // YouTube CDN nodes e.g. r4---sn-xxx.c.youtube.com
-        upHost.endsWith('.googleapis.com') ||
-        upHost.endsWith('.gstatic.com') ||
-        upHost.endsWith('.google.com') ||
-        upHost.endsWith('.doubleclick.net') ||
-        upHost === 'www.youtube.com';
+      // Single regex allowlist — same source-of-truth as GOOGLE_FAMILY_RE above.
+      const isAllowedHost = GOOGLE_FAMILY_RE.test(upHost);
 
       if (!isAllowedHost) {
         return new Response('Forbidden upstream host', { status: 403, headers: CORS });

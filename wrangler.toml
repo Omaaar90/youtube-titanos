@@ -1,0 +1,9 @@
+name = "youtube-titanos"
+main = "tools/cloudflare-worker.js"
+compatibility_date = "2024-01-01"
+
+# The YT_SESSION KV namespace is optional and handles missing bindings gracefully.
+# If you want to use KV caching, bind a KV namespace named YT_SESSION here.
+# [[kv_namespaces]]
+# binding = "YT_SESSION"
+# id = "<YOUR_KV_NAMESPACE_ID>"
