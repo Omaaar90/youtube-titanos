@@ -4,6 +4,7 @@
  * v4 changes:
  *  - Catch-all GOOGLE_FAMILY_RE replaces fragile per-host pattern lists.
  *  - ES5-safe location spoof (no Proxy) for Vewd/Chromium 60 compatibility.
+ *  - youtubei/v1/* API calls forwarded with original auth headers untouched.
  */
 
 const GH_PAGES_BASE = 'https://Omaaar90.github.io/youtube-titanos';
@@ -146,6 +147,47 @@ async function handleRequest(request, env, ctx) {
 
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: CORS });
+    }
+
+    // ── Fast-path: youtubei/v1/* API calls ────────────────────────────────
+    // These are XHR/fetch calls made by YouTube TV's JS with their own
+    // Authorization and X-Goog-* headers already set correctly for
+    // www.youtube.com. We must NOT overwrite cookies or auth headers here —
+    // just change the hostname and add CORS. Touching auth headers causes 403.
+    if (url.pathname.startsWith('/youtubei/')) {
+      const apiUrl = new URL(request.url);
+      apiUrl.protocol = 'https:';
+      apiUrl.hostname = 'www.youtube.com';
+      apiUrl.port = '';
+
+      let body = undefined;
+      if (request.method !== 'GET' && request.method !== 'HEAD') {
+        body = await request.arrayBuffer();
+      }
+
+      const reqHeaders = new Headers(request.headers);
+      reqHeaders.set('host', 'www.youtube.com');
+      reqHeaders.set('origin', 'https://www.youtube.com');
+      reqHeaders.set('referer', 'https://www.youtube.com/tv');
+      // Remove Cloudflare-injected headers only — leave auth untouched
+      reqHeaders.delete('cf-connecting-ip');
+      reqHeaders.delete('cf-ray');
+      reqHeaders.delete('cf-visitor');
+      reqHeaders.delete('cf-ipcountry');
+      reqHeaders.delete('x-forwarded-for');
+
+      const res = await fetch(apiUrl.toString(), {
+        method: request.method,
+        headers: reqHeaders,
+        body,
+        redirect: 'follow',
+      });
+
+      const h = new Headers(res.headers);
+      h.delete('content-security-policy');
+      h.delete('content-security-policy-report-only');
+      for (const [k, v] of Object.entries(CORS)) h.set(k, v);
+      return new Response(res.body, { status: res.status, headers: h });
     }
 
     let reqBody = undefined;
@@ -307,7 +349,7 @@ self.addEventListener('fetch', function(event) {
 '    if (typeof u !== "string") return u;\n' +
 '    if (u.indexOf(WORKER) === 0) return u;\n' +
 '    try {\n' +
-'      var parsed = new URL(u, window.location.href);\n' +
+'      var parsed = new URL(u, _rl.href);\n' +
 '      if (parsed.hostname === "www.youtube.com" || parsed.hostname === "youtube.com") {\n' +
 '        return WORKER + parsed.pathname + parsed.search + parsed.hash;\n' +
 '      }\n' +
@@ -345,7 +387,7 @@ self.addEventListener('fetch', function(event) {
 '    if (target === "_self" || target === "_top" || target === "_parent") {\n' +
 '      return _winOpen.call(window, u, target, features);\n' +
 '    }\n' +
-'    window.location.href = u;\n' +
+'    _rl.href = u;\n' +
 '    return null;\n' +
 '  };\n' +
 '\n' +
@@ -373,12 +415,12 @@ self.addEventListener('fetch', function(event) {
 '    var href = a.getAttribute("href");\n' +
 '    if (!href) return;\n' +
 '    try {\n' +
-'      var parsed = new URL(a.href, window.location.href);\n' +
+'      var parsed = new URL(a.href, _rl.href);\n' +
 '      if ((parsed.hostname === "www.youtube.com" || parsed.hostname === "youtube.com")\n' +
 '          && a.href.indexOf(WORKER) !== 0) {\n' +
 '        e.preventDefault();\n' +
 '        e.stopPropagation();\n' +
-'        window.location.href = WORKER + parsed.pathname + parsed.search + parsed.hash;\n' +
+'        _rl.href = WORKER + parsed.pathname + parsed.search + parsed.hash;\n' +
 '      }\n' +
 '    } catch(err) {}\n' +
 '  }, true);\n' +
