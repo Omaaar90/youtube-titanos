@@ -15,8 +15,6 @@ const SESSION_KV_KEY = 'yt_session_cookies';
 const SESSION_TTL = 60 * 60; // refresh session every 1 hour
 
 // Single source-of-truth for every Google/YouTube domain family we proxy.
-// Covers: video CDN, YouTube CDN edge, images, avatars, static assets,
-// APIs, OAuth, ads. Add new TLDs here and they flow everywhere automatically.
 const GOOGLE_FAMILY_RE = /(?:googlevideo|ytimg|ggpht|gstatic|googleapis)\.com$|doubleclick\.(?:com|net)$|(?:^|\.)(?:youtube|google|accounts\.google)\.com$/;
 
 const CORS = {
@@ -26,11 +24,6 @@ const CORS = {
   'Access-Control-Max-Age': '86400',
 };
 
-// Rewrite any baked-in Google/YouTube URL in HTML/JS text responses so they
-// go through our /__proxy/<host> tunnel instead of hitting the origin directly.
-// IMPORTANT: Only rewrite https?:// prefixed URLs — NOT protocol-relative //
-// URLs, which may appear inside JSON data blobs and config objects where they
-// are not navigable URLs and rewriting them would corrupt the data.
 function rewriteHosts(text, workerOrigin) {
   if (!workerOrigin) return text;
   return text.replace(
@@ -44,14 +37,7 @@ function rewriteHosts(text, workerOrigin) {
   );
 }
 
-/**
- * Fetch a fresh YouTube TV session and extract cookies.
- * Stores them in KV with a TTL so we don't hammer YouTube on every request.
- * Falls back to consent-only cookies on any network error so the worker
- * doesn't hard-crash when YouTube is slow or rate-limiting us.
- */
 async function getSessionCookies(env, ctx) {
-  // Try KV cache first
   if (env.YT_SESSION) {
     try {
       const cached = await env.YT_SESSION.get(SESSION_KV_KEY);
@@ -61,36 +47,28 @@ async function getSessionCookies(env, ctx) {
     }
   }
 
-  // Consent-only fallback — returned immediately if the bootstrap fetch fails
   const FALLBACK = 'CONSENT=YES+; SOCS=CAESEwgDEgk0ODE3Nzk3MjkaAmVuIAEaBgiA_LysBg==';
 
   let cookieString = FALLBACK;
   try {
-    // Bootstrap a fresh session
     const res = await fetch('https://www.youtube.com/tv', {
       headers: {
         'User-Agent': TV_UA,
         'Accept-Language': 'en-US,en;q=0.9',
-        // Inject CONSENT cookie to skip GDPR/cookie-consent redirect
         'Cookie': FALLBACK,
       },
       redirect: 'follow',
     });
 
-    // Collect Set-Cookie headers
     const setCookies = res.headers.getAll
-      ? res.headers.getAll('set-cookie')          // Cloudflare Workers supports getAll
+      ? res.headers.getAll('set-cookie')
       : [res.headers.get('set-cookie')].filter(Boolean);
 
-    // Parse into a single Cookie header string
     const cookieMap = {};
-
-    // Seed with consent cookies first
     cookieMap['CONSENT'] = 'YES+';
     cookieMap['SOCS'] = 'CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg';
 
     for (const raw of setCookies) {
-      // Each raw value is like: "NAME=VALUE; Path=/; ..."
       const pair = raw.split(';')[0].trim();
       const eq = pair.indexOf('=');
       if (eq > 0) {
@@ -104,8 +82,6 @@ async function getSessionCookies(env, ctx) {
       .map(([k, v]) => `${k}=${v}`)
       .join('; ');
 
-    // Cache in KV — use ctx.waitUntil() so the KV write doesn't block the
-    // response. The next request will benefit from the cached value.
     if (env.YT_SESSION && ctx) {
       ctx.waitUntil(
         env.YT_SESSION.put(SESSION_KV_KEY, cookieString, { expirationTtl: SESSION_TTL })
@@ -119,13 +95,8 @@ async function getSessionCookies(env, ctx) {
   return cookieString;
 }
 
-/**
- * Merge session cookies with any cookies already on the request.
- * Request cookies take priority (user may be logged in).
- */
 function mergeCookies(sessionCookies, requestCookies) {
   if (!requestCookies) return sessionCookies;
-  // Build map from session, then overlay request cookies
   const map = {};
   for (const part of sessionCookies.split(';')) {
     const [k, ...rest] = part.trim().split('=');
@@ -138,31 +109,22 @@ function mergeCookies(sessionCookies, requestCookies) {
   return Object.entries(map).map(([k, v]) => `${k}=${v}`).join('; ');
 }
 
-// Strip Cloudflare-injected and browser security headers before forwarding
-// to YouTube. Sending these upstream triggers YouTube's bot-detection and
-// returns 403s. None of them add value on the upstream side.
 function cleanRequestHeaders(reqHeaders) {
-  // sec-fetch-* reveal the request initiator context — TV clients don't send these
   reqHeaders.delete('sec-fetch-site');
   reqHeaders.delete('sec-fetch-mode');
   reqHeaders.delete('sec-fetch-dest');
   reqHeaders.delete('sec-fetch-user');
-  // Cloudflare-specific headers — meaningless to YouTube, flag us as a proxy
   reqHeaders.delete('cf-connecting-ip');
   reqHeaders.delete('cf-ray');
   reqHeaders.delete('cf-visitor');
   reqHeaders.delete('cf-ipcountry');
-  // Cache validators — strip so YouTube always sends fresh content through the proxy
   reqHeaders.delete('if-none-match');
   reqHeaders.delete('if-modified-since');
-  // x-forwarded-for reveals the true client IP and triggers bot-detection 403s
   reqHeaders.delete('x-forwarded-for');
 }
 
 export default {
   async fetch(request, env, ctx) {
-    // Top-level guard: catch any unhandled error so the user never sees a raw
-    // stack trace. Errors are logged for `wrangler tail` inspection.
     try {
       return await handleRequest(request, env, ctx);
     } catch (e) {
@@ -174,11 +136,8 @@ export default {
     }
   },
 
-  // Stub for future cron-based session refresh (add a triggers.crons entry
-  // in wrangler.toml to activate). Runs in the background without a request.
   async scheduled(event, env, ctx) {
     console.info('[scheduled] Session refresh triggered at', new Date().toISOString());
-    // Force-invalidate the KV cache so the next request bootstraps a fresh session.
     if (env.YT_SESSION) {
       await env.YT_SESSION.delete(SESSION_KV_KEY)
         .catch(e => console.warn('[scheduled] KV delete failed:', e.message));
@@ -193,33 +152,23 @@ async function handleRequest(request, env, ctx) {
       return new Response(null, { status: 204, headers: CORS });
     }
 
-    // Read body into memory to ensure it is forwarded correctly (avoids streaming issues in Worker fetch)
     let reqBody = undefined;
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       reqBody = await request.arrayBuffer();
-      // Check if it's an OAuth path (matches direct origin requests and proxied sub-paths)
       const isOAuth = url.pathname.includes('/oauth2/');
       if (isOAuth) {
         try {
-          // Decode body text to inspect and rewrite client credentials on-the-fly
           let bodyText = new TextDecoder().decode(reqBody);
-          
-          // Support custom Client ID / Secret via Cloudflare Worker environment variables,
-          // falling back to Google's permitted Profile 0 TV client ID/secret.
           const targetClientId = env.CUSTOM_CLIENT_ID || '861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com';
           const targetClientSecret = env.CUSTOM_CLIENT_SECRET || 'SboVhoG9s0rNafixCSGGKXAT';
-          
           bodyText = bodyText.replace('861556708454-912i5jlic99ecvu3ro5kqirg0hldli5t.apps.googleusercontent.com', targetClientId);
           bodyText = bodyText.replace('861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com', targetClientId);
           bodyText = bodyText.replace('ju2WuMJMOjilz_h_1dPgFdeU', targetClientSecret);
           bodyText = bodyText.replace('SboVhoG9s0rNafixCSGGKXAT', targetClientSecret);
-          
-          // Restore rewritten scopes to their original protocol/host format
-          bodyText = bodyText.replace(/(\/__proxy\/gdata\.youtube\.com)/gi, 'http://gdata.youtube.com');
+          bodyText = bodyText.replace(/(\/\/__proxy\/gdata\.youtube\.com)/gi, 'http://gdata.youtube.com');
           bodyText = bodyText.replace(/\/__proxy\/([a-z0-9\-\.]+)/gi, 'https://$1');
           bodyText = bodyText.replace(/(%2[fF]__proxy%2[fF]gdata\.youtube\.com)/gi, 'http%3A%2F%2Fgdata.youtube.com');
           bodyText = bodyText.replace(/%2[fF]__proxy%2[fF]([a-z0-9\-\.]+)/gi, 'https%3A%2F%2F$1');
-          
           reqBody = new TextEncoder().encode(bodyText);
         } catch (e) {
           console.error('[OAuth] Failed to rewrite credentials in request body:', e.message);
@@ -227,8 +176,6 @@ async function handleRequest(request, env, ctx) {
       }
     }
 
-    // Get (or bootstrap) session cookies — pass ctx so KV write can be
-    // deferred via ctx.waitUntil() without blocking the response.
     const sessionCookies = await getSessionCookies(env, ctx);
 
     // ── 1. Our built assets from GitHub Pages ──────────────────────────────
@@ -245,11 +192,8 @@ async function handleRequest(request, env, ctx) {
       return new Response(res.body, { status: res.status, headers: h });
     }
 
-    // ── Service Worker — catch-all Google/YouTube family proxy ─────────────
+    // ── Service Worker ──────────────────────────────────────────────────────
     if (url.pathname === '/sw.js') {
-      // GOOGLE_RE: matches every Google/YouTube CDN host family in one pattern.
-      // Written as a string so it survives the template-literal → JS serialisation
-      // without backslash mangling (same trick as the inline interceptor below).
       const GOOGLE_RE_SRC = String.raw`(?:googlevideo|ytimg|ggpht|gstatic|googleapis)\.com$|doubleclick\.(?:com|net)$|(?:^|\.)(?:youtube|google)\.com$`;
       const swCode = `
 'use strict';
@@ -258,9 +202,7 @@ self.addEventListener('install', function(e){ self.skipWaiting(); });
 self.addEventListener('activate', function(e){ e.waitUntil(self.clients.claim()); });
 self.addEventListener('fetch', function(event) {
   var dest = new URL(event.request.url);
-  // Pass through requests already going to our own worker origin.
   if (dest.origin === self.location.origin) return;
-  // Proxy every cross-origin Google/YouTube family request.
   if (GOOGLE_RE.test(dest.hostname)) {
     var proxied = self.location.origin + '/__proxy/' + dest.hostname + dest.pathname + dest.search;
     event.respondWith(
@@ -285,10 +227,7 @@ self.addEventListener('fetch', function(event) {
       });
     }
 
-    // ── 2. YouTube TV HTML — inject bundle + strip security headers ────────
-    // Route 2 covers every YouTube path the TV app can navigate to.
-    // Without this, clicking a video sends the TV browser to youtube.com/watch
-    // directly — bypassing the proxy and showing a broken / home page.
+    // ── 2. YouTube TV HTML — inject fixes + strip security headers ─────────
     const isYTPage =
       url.pathname === '/' ||
       url.pathname === '/tv' ||
@@ -301,6 +240,7 @@ self.addEventListener('fetch', function(event) {
       url.pathname.startsWith('/channel/') ||
       url.pathname.startsWith('/c/') ||
       url.pathname.startsWith('/@');
+
     if (isYTPage) {
       const ytUrl = new URL('https://www.youtube.com/tv');
       url.searchParams.forEach((v, k) => ytUrl.searchParams.set(k, v));
@@ -315,18 +255,35 @@ self.addEventListener('fetch', function(event) {
       const res = await fetch(ytUrl.toString(), { headers: reqHeaders });
       let html = await res.text();
 
-      // Inject our bundle + an inline XHR/fetch monkey-patch.
-      // Catches ALL cross-origin Google/YouTube family requests before the browser
-      // blocks them — no per-host pattern needed, one broad regex covers everything.
       const WORKER_ORIGIN = url.origin;
-      // GOOGLE_RE_SRC: serialised as a JSON string so backslashes survive the
-      // template-literal → HTML → JS parser chain without double-evaluation.
       const GOOGLE_RE_SRC = String.raw`(?:googlevideo|ytimg|ggpht|gstatic|googleapis)\.com$|doubleclick\.(?:com|net)$|(?:^|\.)(?:youtube|google)\.com$`;
+
       const inlineInterceptor = `<script>
 (function(){
   var WORKER = ${JSON.stringify(WORKER_ORIGIN)};
-  // Matches every Google/YouTube CDN family — auto-covers new edge hostnames.
   var GOOGLE_RE = new RegExp(${JSON.stringify(GOOGLE_RE_SRC)});
+
+  // ── FIX 1: Spoof window.location so YouTube's internal debug check sees
+  // 'www.youtube.com' as the hostname. Without this, YouTube TV injects a red
+  // "NO DEBUG ACCESS DOMAIN=<your-worker-url>" banner on every page load.
+  try {
+    var _realLocation = window.location;
+    Object.defineProperty(window, 'location', {
+      get: function() {
+        return new Proxy(_realLocation, {
+          get: function(target, prop) {
+            if (prop === 'hostname' || prop === 'host') return 'www.youtube.com';
+            if (prop === 'origin') return 'https://www.youtube.com';
+            if (prop === 'href') return target.href.replace(WORKER, 'https://www.youtube.com');
+            var val = target[prop];
+            return (typeof val === 'function') ? val.bind(target) : val;
+          }
+        });
+      },
+      configurable: true,
+    });
+  } catch(e) { console.warn('[titanos] location spoof failed:', e); }
+
   function isGoogleHost(url) {
     try { return GOOGLE_RE.test(new URL(url).hostname); } catch(e) { return false; }
   }
@@ -334,9 +291,8 @@ self.addEventListener('fetch', function(event) {
   function rewriteGV(url) {
     if (typeof url !== 'string' || !isGoogleHost(url)) return url;
     var host = new URL(url).hostname;
-    // Don't double-proxy — if already pointing at our worker, pass through.
     if (url.startsWith(WORKER)) return url;
-    return url.replace(/https?:\\/\\/[^\\/?#]+/, WORKER + '/__proxy/' + host);
+    return url.replace(/https?:\/\/[^\/?#]+/, WORKER + '/__proxy/' + host);
   }
 
   function rewriteUrl(url) {
@@ -351,7 +307,7 @@ self.addEventListener('fetch', function(event) {
     return url;
   }
 
-  // ── Patch fetch ──────────────────────────────────────────────────────────
+  // ── Patch fetch ───────────────────────────────────────────────────────────
   var _fetch = window.fetch;
   window.fetch = function(input, init) {
     var url = (typeof input === 'string') ? input : (input && input.url) || '';
@@ -363,36 +319,41 @@ self.addEventListener('fetch', function(event) {
     return _fetch.call(this, input, init);
   };
 
-  // ── Patch XHR prototype.open (catches new XHR() after this script) ───────
+  // ── Patch XHR ─────────────────────────────────────────────────────────────
   var _open = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function(method, url) {
     return _open.apply(this, [method, rewriteGV(url)].concat(
       Array.prototype.slice.call(arguments, 2)
     ));
   };
-
-  // ── Patch XHR constructor (catches cached references taken before this) ──
   try {
     var _NativeXHR = window.XMLHttpRequest;
     var _PatchedXHR = function() { return new _NativeXHR(); };
-    _PatchedXHR.prototype = _NativeXHR.prototype; // share prototype — patch above applies
+    _PatchedXHR.prototype = _NativeXHR.prototype;
     Object.defineProperty(window, 'XMLHttpRequest', {
       get: function() { return _PatchedXHR; },
       configurable: true,
     });
   } catch(e) {}
 
-  // ── Block new-tab navigation (TV browser fix) ─────────────────────────────
+  // ── FIX 2: Block about:blank tab opens (TV browser video playback fix) ────
+  // YouTube TV uses window.open('about:blank','_blank') as step 1 of a
+  // two-phase video navigation. On a single-tab TV browser like Vewd this
+  // creates a blank tab and kills the session. Return null to abort it.
   var _winOpen = window.open.bind(window);
   window.open = function(url, target, features) {
-    if (url) { url = rewriteUrl(url); }
+    // Block any call that would produce a blank/empty tab
+    if (!url || url === 'about:blank' || url === 'about:newtab' || url === '') return null;
+    url = rewriteUrl(url);
     if (target === '_self' || target === '_top' || target === '_parent') {
       return _winOpen(url, target, features);
     }
-    if (url) { window.location.href = url; }
+    // All other targets (_blank, named) → same-tab navigation
+    window.location.href = url;
     return null;
   };
 
+  // Strip target="_blank" from injected anchors via MutationObserver
   var _mo = new MutationObserver(function(mutations) {
     for (var i = 0; i < mutations.length; i++) {
       var nodes = mutations[i].addedNodes;
@@ -407,18 +368,14 @@ self.addEventListener('fetch', function(event) {
   });
   _mo.observe(document.documentElement || document, { childList: true, subtree: true });
 
+  // Click capture — rewrite cross-origin YouTube links to go via Worker
   document.addEventListener('click', function(e) {
     var a = e.target && e.target.closest ? e.target.closest('a') : null;
     if (!a) return;
-    
     var t = a.getAttribute('target');
-    if (t && (t === '_blank' || t === '_new')) {
-      a.removeAttribute('target');
-    }
-
+    if (t && (t === '_blank' || t === '_new')) a.removeAttribute('target');
     var href = a.getAttribute('href');
     if (!href) return;
-
     try {
       var u = new URL(a.href, window.location.href);
       if ((u.hostname === 'www.youtube.com' || u.hostname === 'youtube.com') && !a.href.startsWith(WORKER)) {
@@ -429,15 +386,18 @@ self.addEventListener('fetch', function(event) {
     } catch(_) {}
   }, true);
 })();
-<\/script>`;
-      // Add version query parameter to script source to force the TV browser to bypass local JS cache
-      html = html.replace('<head>', '<head>' + inlineInterceptor + '<script src="/index.js?v=9"></script>');
+<\/script>
+<style>
+  /* FIX 3: Hide mouse cursor — TV is remote-controlled, no pointer needed.
+     Using !important on every element overrides any YouTube TV inline style
+     or specificity that might re-show the cursor on hover. */
+  *, *::before, *::after { cursor: none !important; }
+</style>`;
 
-      // Rewrite static host URLs
+      html = html.replace('<head>', '<head>' + inlineInterceptor + '<script src="/index.js?v=9"><\/script>');
+
       html = rewriteHosts(html, WORKER_ORIGIN);
 
-      // FIX: Also rewrite redirector.googlevideo.com inside ytInitialPlayerResponse
-      // and ytcfg JSON blobs — the player reads these at runtime to build stream URLs
       html = html.replace(
         /"(?:redirectorUrl|basejsUrl|hlsvp|dashManifestUrl)":\s*"(https?:\/\/redirector\.googlevideo\.com[^"]+)"/g,
         (match, capturedUrl) => match.replace(capturedUrl, capturedUrl.replace('https://redirector.googlevideo.com', '/__proxy/redirector.googlevideo.com'))
@@ -452,7 +412,6 @@ self.addEventListener('fetch', function(event) {
       h.delete('etag');
       h.delete('last-modified');
       h.set('content-type', 'text/html; charset=utf-8');
-      // Force the TV browser to never cache the bootstrap page
       h.set('cache-control', 'no-store, no-cache, must-revalidate, max-age=0');
       for (const [k, v] of Object.entries(CORS)) h.set(k, v);
 
@@ -466,15 +425,11 @@ self.addEventListener('fetch', function(event) {
       const upHost = slash === -1 ? rest : rest.slice(0, slash);
       const upPath = slash === -1 ? '/' : rest.slice(slash);
 
-      // Block unresolvable UUID-prefixed googlevideo subdomains
       if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-/.test(upHost)) {
         return new Response(null, { status: 204, headers: CORS });
       }
 
-      // Single regex allowlist — same source-of-truth as GOOGLE_FAMILY_RE above.
-      const isAllowedHost = GOOGLE_FAMILY_RE.test(upHost);
-
-      if (!isAllowedHost) {
+      if (!GOOGLE_FAMILY_RE.test(upHost)) {
         return new Response('Forbidden upstream host', { status: 403, headers: CORS });
       }
 
@@ -509,14 +464,13 @@ self.addEventListener('fetch', function(event) {
     }
 
     // ── 4. Everything else → proxy to youtube.com ─────────────────────────
-    // FIX: OAuth device flow lives on oauth2.googleapis.com, not youtube.com
-    const isOAuthPath = url.pathname.startsWith('/o/oauth2/') || 
+    const isOAuthPath = url.pathname.startsWith('/o/oauth2/') ||
                         url.pathname.startsWith('/oauth2/');
     const isInitPlayback = url.pathname.startsWith('/initplayback');
 
     const targetUrl = new URL(request.url);
     targetUrl.protocol = 'https:';
-    
+
     if (isOAuthPath) {
       if (reqBody) {
         try {
@@ -526,7 +480,6 @@ self.addEventListener('fetch', function(event) {
           console.error('[OAuth-Proxy] Failed to decode body:', err.message);
         }
       }
-      // Route to www.youtube.com where the official YouTube TV OAuth proxy lives
       targetUrl.hostname = 'www.youtube.com';
     } else if (isInitPlayback) {
       targetUrl.hostname = 'redirector.googlevideo.com';
