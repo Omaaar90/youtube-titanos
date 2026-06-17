@@ -195,8 +195,8 @@ async function handleRequest(request, env, ctx) {
     let reqBody = undefined;
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       reqBody = await request.arrayBuffer();
-      // Check if it's an OAuth path (either /o/oauth2/ or /oauth2/)
-      const isOAuth = url.pathname.startsWith('/o/oauth2/') || url.pathname.startsWith('/oauth2/');
+      // Check if it's an OAuth path (matches direct origin requests and proxied sub-paths)
+      const isOAuth = url.pathname.includes('/oauth2/');
       if (isOAuth) {
         try {
           // Decode body text to inspect and rewrite client credentials on-the-fly
