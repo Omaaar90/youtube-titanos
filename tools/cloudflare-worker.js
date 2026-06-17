@@ -490,7 +490,5 @@ self.addEventListener('fetch', function(event) {
     h.delete('content-security-policy-report-only');
     h.delete('x-frame-options');
     for (const [k, v] of Object.entries(CORS)) h.set(k, v);
-
     return new Response(res.body, { status: res.status, headers: h });
-  },
-};
+}
