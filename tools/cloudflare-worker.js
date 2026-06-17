@@ -1,13 +1,13 @@
 /**
- * YouTube-TitanOS — Cloudflare Worker Reverse Proxy v6
+ * YouTube-TitanOS — Cloudflare Worker Reverse Proxy v7
  *
- * v6 changes:
- *  - FIXED: Strip is_account_switch=1, hrld=1, fltor=1 params before
- *           forwarding to YouTube TV — these caused an infinite reload loop.
- *  - FIXED: Forward Set-Cookie headers from YouTube auth responses back to
- *           the TV browser so the session cookie persists across navigations.
- *  - FIXED: Exclude /__log XHR responses from tvlog() to stop the recursive
- *           log storm that caused ~35ms polling loops flooding the log buffer.
+ * v7 changes:
+ *  - FIXED: Strip is_account_switch=1, hrld=1, fltor=1 params client-side too.
+ *           YouTube TV was re-introducing them via History API / location writes,
+ *           which caused the TV browser to reload into the account-switch loop.
+ *  - FIXED: Suppress the Vewd-specific keyMode unhandled rejection so remote
+ *           navigation does not die when YouTube TV's input manager races init.
+ *  - RETAINED: v6 cookie forwarding and /__log recursion fixes.
  */
 
 const GH_PAGES_BASE = 'https://Omaaar90.github.io/youtube-titanos';
@@ -394,13 +394,49 @@ self.addEventListener('fetch', function(event) {
     const GOOGLE_RE_SRC = String.raw`(?:googlevideo|ytimg|ggpht|gstatic|googleapis)\.com$|doubleclick\.(?:com|net)$|(?:^|\.)(?:youtube|google)\.com$`;
 
     // ── Injected script (ES5, Vewd/Chromium 60 safe) ──────────────────────
-    // FIX 3: tvlog() now skips logging for /__log XHR responses to prevent
-    // the recursive storm where each log POST triggers another xhr_res event.
     const inlineInterceptor = '<script>\n' +
 '(function(){\n' +
 '  var WORKER = ' + JSON.stringify(WORKER_ORIGIN) + ';\n' +
+'  var STRIP_PARAMS = ' + JSON.stringify(STRIP_PARAMS) + ';\n' +
 '  var GOOGLE_RE = new RegExp(' + JSON.stringify(GOOGLE_RE_SRC) + ');\n' +
 '  var _rl = window.location;\n' +
+'\n' +
+'  // ── FIX v7a: Strip account-switch params CLIENT-SIDE ──────────────────\n' +
+'  // YouTube TV JS writes is_account_switch=1 etc. back into the URL via\n' +
+'  // history.pushState / replaceState after the server-side strip. We patch\n' +
+'  // both history methods and also clean up immediately if the params are\n' +
+'  // already present on the current URL when this script runs.\n' +
+'  function stripAccountSwitchParams(href) {\n' +
+'    try {\n' +
+'      var u = new URL(href, _rl.href);\n' +
+'      var dirty = false;\n' +
+'      STRIP_PARAMS.forEach(function(p) {\n' +
+'        if (u.searchParams.has(p)) { u.searchParams.delete(p); dirty = true; }\n' +
+'      });\n' +
+'      return dirty ? (u.pathname + u.search + u.hash) : href;\n' +
+'    } catch(e) { return href; }\n' +
+'  }\n' +
+'\n' +
+'  var _pushState = history.pushState ? history.pushState.bind(history) : null;\n' +
+'  if (_pushState) {\n' +
+'    history.pushState = function(state, title, href) {\n' +
+'      if (href) href = stripAccountSwitchParams(href);\n' +
+'      return _pushState(state, title, href);\n' +
+'    };\n' +
+'  }\n' +
+'\n' +
+'  var _replaceState = history.replaceState ? history.replaceState.bind(history) : null;\n' +
+'  if (_replaceState) {\n' +
+'    history.replaceState = function(state, title, href) {\n' +
+'      if (href) href = stripAccountSwitchParams(href);\n' +
+'      return _replaceState(state, title, href);\n' +
+'    };\n' +
+'  }\n' +
+'\n' +
+'  // Immediate cleanup if params already in URL when script runs\n' +
+'  if (location.search && /(?:^|[?&])(is_account_switch|hrld|fltor)=/.test(location.search)) {\n' +
+'    history.replaceState(null, document.title, stripAccountSwitchParams(_rl.href));\n' +
+'  }\n' +
 '\n' +
 '  // ── Telemetry: POST events to /__log ──────────────────────────────────\n' +
 '  function tvlog(type, payload) {\n' +
@@ -483,9 +519,7 @@ self.addEventListener('fetch', function(event) {
 '  XMLHttpRequest.prototype.send = function() {\n' +
 '    var self = this;\n' +
 '    self.addEventListener("load", function() {\n' +
-'      // FIX 3: Skip logging /__log responses — logging them causes a recursive\n' +
-'      // storm where every tvlog() POST fires another xhr_res, which fires another\n' +
-'      // tvlog(), flooding the buffer with ~35ms interval /__log entries.\n' +
+'      // Skip logging /__log responses to prevent recursive log storm\n' +
 '      if (self.responseURL && self.responseURL.indexOf("/__log") !== -1) return;\n' +
 '      tvlog("xhr_res", { status: self.status, url: self.responseURL });\n' +
 '    });\n' +
@@ -586,7 +620,17 @@ self.addEventListener('fetch', function(event) {
 '  };\n' +
 '\n' +
 '  window.addEventListener("unhandledrejection", function(e) {\n' +
-'    tvlog("promise_reject", { reason: String(e.reason) });\n' +
+'    var reason = String(e && e.reason);\n' +
+'    tvlog("promise_reject", { reason: reason });\n' +
+'    // FIX v7b: Suppress Vewd-specific keyMode crash.\n' +
+'    // YouTube TV input manager sets obj.keyMode where obj is sometimes\n' +
+'    // undefined on Vewd. Preventing default stops the rejection from\n' +
+'    // propagating and killing the entire remote control handler.\n' +
+'    if (reason.indexOf("keyMode") !== -1) {\n' +
+'      if (e && e.preventDefault) e.preventDefault();\n' +
+'      tvlog("promise_reject_suppressed", { reason: reason });\n' +
+'      return false;\n' +
+'    }\n' +
 '  });\n' +
 '\n' +
 '  tvlog("boot", { userAgent: navigator.userAgent, href: _rl.href });\n' +
