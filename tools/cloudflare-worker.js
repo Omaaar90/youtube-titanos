@@ -233,6 +233,7 @@ self.addEventListener('fetch', function(event) {
         headers: event.request.headers,
         body: (event.request.method !== 'GET' && event.request.method !== 'HEAD')
           ? event.request.body : undefined,
+        duplex: 'half',
         redirect: 'follow',
       })
     );
@@ -284,7 +285,7 @@ self.addEventListener('fetch', function(event) {
     var host = new URL(url).hostname;
     // Don't double-proxy — if already pointing at our worker, pass through.
     if (url.startsWith(WORKER)) return url;
-    return url.replace(/https?:\/\/[^/?#]+/, WORKER + '/__proxy/' + host);
+    return url.replace(/https?:\\/\\/[^\\/?#]+/, WORKER + '/__proxy/' + host);
   }
 
   // ── Patch fetch ──────────────────────────────────────────────────────────
