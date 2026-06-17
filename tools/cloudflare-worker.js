@@ -1,14 +1,13 @@
 /**
- * YouTube-TitanOS — Cloudflare Worker Reverse Proxy v5
+ * YouTube-TitanOS — Cloudflare Worker Reverse Proxy v6
  *
- * v5 changes:
- *  - /__log POST  : browser-side tvlog() posts events here (stored in ring buffer)
- *  - /__log GET   : returns last N log entries as JSON — open in browser to inspect
- *  - trace()      : every proxy branch logs reqId, method, path, upstream, status,
- *                   location, content-type, range, content-range
- *  - Injected script extended with full tvlog() hooks:
- *      window.open, anchor clicks, fetch, XHR, <video> events,
- *      window.onerror, unhandledrejection, account_switch/signin detection
+ * v6 changes:
+ *  - FIXED: Strip is_account_switch=1, hrld=1, fltor=1 params before
+ *           forwarding to YouTube TV — these caused an infinite reload loop.
+ *  - FIXED: Forward Set-Cookie headers from YouTube auth responses back to
+ *           the TV browser so the session cookie persists across navigations.
+ *  - FIXED: Exclude /__log XHR responses from tvlog() to stop the recursive
+ *           log storm that caused ~35ms polling loops flooding the log buffer.
  */
 
 const GH_PAGES_BASE = 'https://Omaaar90.github.io/youtube-titanos';
@@ -16,6 +15,10 @@ const TV_UA = 'Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) AppleWebKit/538.1 (KHTML
 const SESSION_KV_KEY = 'yt_session_cookies';
 const SESSION_TTL = 60 * 60;
 const LOG_MAX = 200; // in-memory ring buffer size
+
+// Params YouTube TV uses internally to trigger account-switch UI loops.
+// We strip them before forwarding so YT boots cleanly.
+const STRIP_PARAMS = ['is_account_switch', 'hrld', 'fltor'];
 
 const GOOGLE_FAMILY_RE = /(?:googlevideo|ytimg|ggpht|gstatic|googleapis)\.com$|doubleclick\.(?:com|net)$|(?:^|\.)(?:youtube|google|accounts\.google)\.com$/;
 
@@ -27,8 +30,6 @@ const CORS = {
 };
 
 // ── In-memory ring buffer ────────────────────────────────────────────────────
-// Survives within a single Worker isolate lifetime (~30s idle eviction).
-// Good enough for a live debugging session — deploy, open TV, watch logs.
 const LOG_RING = [];
 
 function ringPush(entry) {
@@ -143,6 +144,30 @@ function cleanRequestHeaders(reqHeaders) {
   reqHeaders.delete('x-forwarded-for');
 }
 
+/**
+ * Forward Set-Cookie headers from a YouTube response back to the TV browser.
+ * Rewrites the domain/path attributes so the cookie is set on our Worker
+ * origin (yt.abduljawad.de) instead of .youtube.com, which the browser
+ * would otherwise reject as a cross-origin cookie.
+ */
+function forwardSetCookies(upstreamHeaders, outHeaders, workerHostname) {
+  const setCookies = upstreamHeaders.getAll
+    ? upstreamHeaders.getAll('set-cookie')
+    : [upstreamHeaders.get('set-cookie')].filter(Boolean);
+
+  for (const raw of setCookies) {
+    // Rewrite Domain= to our worker hostname and ensure SameSite=None; Secure
+    // is NOT set (TV uses http://), so we strip Secure and SameSite.
+    let rewritten = raw
+      .replace(/;?\s*domain=[^;]*/gi, '')
+      .replace(/;?\s*secure/gi, '')
+      .replace(/;?\s*samesite=[^;]*/gi, '')
+      .replace(/;?\s*partitioned/gi, '');
+    rewritten += `; Domain=${workerHostname}; Path=/`;
+    outHeaders.append('set-cookie', rewritten);
+  }
+}
+
 // ── Main export ──────────────────────────────────────────────────────────────
 
 export default {
@@ -178,8 +203,6 @@ async function handleRequest(request, env, ctx) {
   }
 
   // ── /__log  — browser telemetry endpoint ───────────────────────────────────
-  // POST: browser tvlog() sends JSON events here
-  // GET:  ?n=50 returns last N entries for inspection (open in any browser)
   if (url.pathname === '/__log') {
     if (request.method === 'POST') {
       try {
@@ -339,7 +362,16 @@ self.addEventListener('fetch', function(event) {
     trace(reqId, 'yt_page_req', { method: request.method, path: url.pathname, search: url.search });
 
     const ytUrl = new URL('https://www.youtube.com/tv');
-    url.searchParams.forEach((v, k) => ytUrl.searchParams.set(k, v));
+    url.searchParams.forEach((v, k) => {
+      // FIX 1: Strip params that cause YouTube TV to enter the account-switch
+      // reload loop. When these are forwarded, YT keeps redirecting back to
+      // itself with is_account_switch=1 forever, preventing any page from loading.
+      if (!STRIP_PARAMS.includes(k)) {
+        ytUrl.searchParams.set(k, v);
+      } else {
+        trace(reqId, 'stripped_param', { param: k, value: v });
+      }
+    });
 
     const reqHeaders = new Headers(request.headers);
     reqHeaders.set('User-Agent', TV_UA);
@@ -358,11 +390,12 @@ self.addEventListener('fetch', function(event) {
     });
 
     const WORKER_ORIGIN = url.origin;
+    const WORKER_HOSTNAME = url.hostname;
     const GOOGLE_RE_SRC = String.raw`(?:googlevideo|ytimg|ggpht|gstatic|googleapis)\.com$|doubleclick\.(?:com|net)$|(?:^|\.)(?:youtube|google)\.com$`;
 
     // ── Injected script (ES5, Vewd/Chromium 60 safe) ──────────────────────
-    // All logic in one IIFE. tvlog() sends events to /__log for inspection.
-    // View logs: open https://yt.abduljawad.de/__log in any browser.
+    // FIX 3: tvlog() now skips logging for /__log XHR responses to prevent
+    // the recursive storm where each log POST triggers another xhr_res event.
     const inlineInterceptor = '<script>\n' +
 '(function(){\n' +
 '  var WORKER = ' + JSON.stringify(WORKER_ORIGIN) + ';\n' +
@@ -450,9 +483,14 @@ self.addEventListener('fetch', function(event) {
 '  XMLHttpRequest.prototype.send = function() {\n' +
 '    var self = this;\n' +
 '    self.addEventListener("load", function() {\n' +
+'      // FIX 3: Skip logging /__log responses — logging them causes a recursive\n' +
+'      // storm where every tvlog() POST fires another xhr_res, which fires another\n' +
+'      // tvlog(), flooding the buffer with ~35ms interval /__log entries.\n' +
+'      if (self.responseURL && self.responseURL.indexOf("/__log") !== -1) return;\n' +
 '      tvlog("xhr_res", { status: self.status, url: self.responseURL });\n' +
 '    });\n' +
 '    self.addEventListener("error", function() {\n' +
+'      if (self.responseURL && self.responseURL.indexOf("/__log") !== -1) return;\n' +
 '      tvlog("xhr_err", { status: self.status, url: self.responseURL });\n' +
 '    });\n' +
 '    return _xhrSend.apply(this, arguments);\n' +
@@ -509,7 +547,6 @@ self.addEventListener('fetch', function(event) {
 '  }, true);\n' +
 '\n' +
 '  // ── <video> element events ────────────────────────────────────────────\n' +
-'  // Observe DOM for video elements added by YouTube TV player\n' +
 '  var _vidMo = new MutationObserver(function(mutations) {\n' +
 '    for (var i = 0; i < mutations.length; i++) {\n' +
 '      var nodes = mutations[i].addedNodes;\n' +
@@ -582,6 +619,12 @@ self.addEventListener('fetch', function(event) {
     h.set('cache-control', 'no-store, no-cache, must-revalidate, max-age=0');
     for (const [k, v] of Object.entries(CORS)) h.set(k, v);
 
+    // FIX 2: Forward Set-Cookie headers from YouTube's response back to the
+    // TV browser, rewritten to our Worker domain. Without this the TV browser
+    // never receives auth cookies (LOGIN, SID, SSID, etc.) and every page load
+    // looks like an unauthenticated session, triggering is_account_switch again.
+    forwardSetCookies(res.headers, h, WORKER_HOSTNAME);
+
     return new Response(html, { status: res.status, headers: h });
   }
 
@@ -645,6 +688,12 @@ self.addEventListener('fetch', function(event) {
     h.delete('content-security-policy-report-only');
     h.delete('x-frame-options');
     for (const [k, v] of Object.entries(CORS)) h.set(k, v);
+
+    // Also forward auth cookies from proxied Google/accounts responses
+    if (upHost.includes('accounts.google') || upHost.includes('google.com')) {
+      forwardSetCookies(res.headers, h, url.hostname);
+    }
+
     return new Response(res.body, { status: res.status, headers: h });
   }
 
@@ -721,6 +770,9 @@ self.addEventListener('fetch', function(event) {
     finalHeaders.delete('etag');
     finalHeaders.delete('last-modified');
     for (const [k, v] of Object.entries(CORS)) finalHeaders.set(k, v);
+
+    // Forward auth cookies on fallback text responses too (OAuth flows)
+    forwardSetCookies(res.headers, finalHeaders, url.hostname);
 
     return new Response(text, {
       status: res.status,
