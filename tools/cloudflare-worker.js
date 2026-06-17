@@ -173,30 +173,12 @@ export default {
         self.addEventListener('fetch', (event) => {
           const url = event.request.url;
           
-          // Intercept redirector.googlevideo.com requests
-          if (url.includes('redirector.googlevideo.com')) {
+          // Intercept *.googlevideo.com AND *.c.youtube.com CDN nodes
+          const cdnMatch = url.match(/https?:\/\/([a-z0-9][a-z0-9\-\.]*\.(?:googlevideo\.com|c\.youtube\.com))/);
+          if (cdnMatch) {
+            const host = cdnMatch[1];
             const proxied = url.replace(
-              /https?:\\/\\/redirector\\.googlevideo\\.com/,
-              self.location.origin + '/__proxy/redirector.googlevideo.com'
-            );
-            event.respondWith(
-              fetch(proxied, {
-                method: event.request.method,
-                headers: event.request.headers,
-                body: event.request.method !== 'GET' && event.request.method !== 'HEAD'
-                  ? event.request.body : undefined,
-                redirect: 'follow',
-              })
-            );
-            return;
-          }
-
-          // Intercept *.googlevideo.com CDN nodes (rr*.googlevideo.com)
-          const googlevideoMatch = url.match(/https?:\\/\\/([a-z0-9-]+\\.googlevideo\\.com)/);
-          if (googlevideoMatch) {
-            const host = googlevideoMatch[1];
-            const proxied = url.replace(
-              new RegExp('https?:\\\\/\\\\/' + host.replace(/\\./g, '\\\\.')),
+              new RegExp('https?:\\/\\/' + host.replace(/\./g, '\\.')),
               self.location.origin + '/__proxy/' + host
             );
             event.respondWith(
@@ -248,7 +230,8 @@ export default {
   var WORKER = ${JSON.stringify(WORKER_ORIGIN)};
   // Use RegExp constructor — regex literals inside template-literal→HTML strings
   // have their backslashes double-evaluated, causing SyntaxError.
-  var GV_RE = new RegExp('https?:\\/\\/([a-z0-9\\-]+\\.googlevideo\\.com)');
+  // Matches both *.googlevideo.com AND *.c.youtube.com (e.g. r4---sn-xxx.c.youtube.com)
+  var GV_RE = new RegExp('https?:\\/\\/([a-z0-9][a-z0-9\\-\\.]*\\.(?:googlevideo\\.com|c\\.youtube\\.com))');
 
   function rewriteGV(url) {
     if (typeof url !== 'string') return url;
@@ -332,6 +315,7 @@ export default {
       const isAllowedHost =
         REWRITE_HOSTS.includes(upHost) ||
         upHost.endsWith('.googlevideo.com') ||
+        upHost.endsWith('.c.youtube.com') ||   // YouTube CDN nodes e.g. r4---sn-xxx.c.youtube.com
         upHost.endsWith('.googleapis.com') ||
         upHost.endsWith('.gstatic.com') ||
         upHost.endsWith('.google.com') ||
@@ -390,9 +374,11 @@ export default {
     targetUrl.protocol = 'https:';
     
     if (isOAuthPath) {
-      targetUrl.hostname = 'oauth2.googleapis.com';
-      // Keep the /o/ prefix — oauth2.googleapis.com expects /o/oauth2/...
-      // (do NOT strip it, the path maps as-is)
+      // /o/oauth2/device/code lives on accounts.google.com, not oauth2.googleapis.com
+      // oauth2.googleapis.com uses /token and /revoke without the /o/ prefix
+      targetUrl.hostname = url.pathname.startsWith('/o/oauth2/')
+        ? 'accounts.google.com'
+        : 'oauth2.googleapis.com';
     } else if (isInitPlayback) {
       targetUrl.hostname = 'redirector.googlevideo.com';
     } else {
