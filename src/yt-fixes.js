@@ -21,39 +21,52 @@ export function initYouTubeFixes() {
  *  2. Patch window.open(): route any call to same-tab navigation instead.
  */
 function initLinkFix() {
+    const WORKER = window.location.origin;
+
+    function rewriteUrl(url) {
+        if (typeof url !== 'string') return url;
+        if (url.startsWith(WORKER)) return url;
+        try {
+            const u = new URL(url, window.location.href);
+            if (u.hostname === 'www.youtube.com' || u.hostname === 'youtube.com') {
+                return WORKER + u.pathname + u.search + u.hash;
+            }
+        } catch (e) {}
+        return url;
+    }
+
     // 1. Intercept link clicks at the capture phase (runs before YouTube's handlers)
     document.addEventListener('click', (e) => {
-        const anchor = e.target.closest('a[target]');
+        const anchor = e.target && e.target.closest ? e.target.closest('a') : null;
         if (!anchor) return;
+
         const target = anchor.getAttribute('target');
-        if (target === '_blank' || target === '_new') {
+        if (target && (target === '_blank' || target === '_new')) {
             anchor.removeAttribute('target');
-            // If the href is a full YouTube URL, extract the path so the
-            // leanback router can handle it without a hard navigation.
-            const href = anchor.href;
-            if (href && href.includes('youtube.com')) {
-                try {
-                    const url = new URL(href);
-                    // Only rewrite to same origin to avoid open-redirect issues
-                    if (url.origin === location.origin) {
-                        e.preventDefault();
-                        e.stopPropagation();
-                        window.location.href = href;
-                    }
-                    // else: let it fall through as same-tab now (target removed)
-                } catch (_) { /* not a valid URL, leave as-is */ }
-            }
         }
+
+        const href = anchor.getAttribute('href');
+        if (!href) return;
+
+        try {
+            const u = new URL(anchor.href, window.location.href);
+            if ((u.hostname === 'www.youtube.com' || u.hostname === 'youtube.com') && !anchor.href.startsWith(WORKER)) {
+                e.preventDefault();
+                e.stopPropagation();
+                window.location.href = WORKER + u.pathname + u.search + u.hash;
+            }
+        } catch (_) {}
     }, true /* capture */);
 
     // 2. Block window.open() — YouTube TV rarely uses this, but just in case
     const _open = window.open.bind(window);
     window.open = function(url, target, features) {
-        // Allow same-tab/same-frame targets
-        if (!target || target === '_self' || target === '_top' || target === '_parent') {
+        if (url) {
+            url = rewriteUrl(url);
+        }
+        if (target === '_self' || target === '_top' || target === '_parent') {
             return _open(url, target, features);
         }
-        // Redirect new-window/new-tab calls to same-tab navigation
         if (url) {
             console.log('[YT-Fixes] Intercepted window.open(), redirecting same-tab:', url);
             window.location.href = url;

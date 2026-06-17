@@ -31,12 +31,14 @@ const CORS = {
 // IMPORTANT: Only rewrite https?:// prefixed URLs — NOT protocol-relative //
 // URLs, which may appear inside JSON data blobs and config objects where they
 // are not navigable URLs and rewriting them would corrupt the data.
-function rewriteHosts(text) {
+function rewriteHosts(text, workerOrigin) {
+  if (!workerOrigin) return text;
   return text.replace(
     /https?:\/\/([a-z0-9][a-z0-9\-\.]*\.(?:googlevideo|ytimg|ggpht|gstatic|googleapis)\.com|[a-z0-9][a-z0-9\-\.]*\.doubleclick\.(?:com|net)|(?:[a-z0-9][a-z0-9\-]*\.)*(?:youtube|google)\.com)/g,
     (match, host) => {
-      // Don't rewrite www.youtube.com — main page handled by route 2 directly.
-      if (host === 'www.youtube.com') return match;
+      if (host === 'www.youtube.com' || host === 'youtube.com') {
+        return workerOrigin;
+      }
       return `/__proxy/${host}`;
     }
   );
@@ -337,6 +339,18 @@ self.addEventListener('fetch', function(event) {
     return url.replace(/https?:\\/\\/[^\\/?#]+/, WORKER + '/__proxy/' + host);
   }
 
+  function rewriteUrl(url) {
+    if (typeof url !== 'string') return url;
+    if (url.startsWith(WORKER)) return url;
+    try {
+      var u = new URL(url, window.location.href);
+      if (u.hostname === 'www.youtube.com' || u.hostname === 'youtube.com') {
+        return WORKER + u.pathname + u.search + u.hash;
+      }
+    } catch(e) {}
+    return url;
+  }
+
   // ── Patch fetch ──────────────────────────────────────────────────────────
   var _fetch = window.fetch;
   window.fetch = function(input, init) {
@@ -371,7 +385,8 @@ self.addEventListener('fetch', function(event) {
   // ── Block new-tab navigation (TV browser fix) ─────────────────────────────
   var _winOpen = window.open.bind(window);
   window.open = function(url, target, features) {
-    if (!target || target === '_self' || target === '_top' || target === '_parent') {
+    if (url) { url = rewriteUrl(url); }
+    if (target === '_self' || target === '_top' || target === '_parent') {
       return _winOpen(url, target, features);
     }
     if (url) { window.location.href = url; }
@@ -393,32 +408,33 @@ self.addEventListener('fetch', function(event) {
   _mo.observe(document.documentElement || document, { childList: true, subtree: true });
 
   document.addEventListener('click', function(e) {
-    var a = e.target && e.target.closest ? e.target.closest('a[target]') : null;
+    var a = e.target && e.target.closest ? e.target.closest('a') : null;
     if (!a) return;
+    
     var t = a.getAttribute('target');
-    if (t === '_blank' || t === '_new') {
+    if (t && (t === '_blank' || t === '_new')) {
       a.removeAttribute('target');
-      var href = a.href;
-      if (href && href.includes('youtube.com') && !href.startsWith(WORKER)) {
-        try {
-          var u = new URL(href);
-          if (u.origin === 'https://www.youtube.com') {
-            e.preventDefault();
-            e.stopPropagation();
-            window.location.href = WORKER + u.pathname + u.search + u.hash;
-            return;
-          }
-        } catch(_) {}
-      }
     }
+
+    var href = a.getAttribute('href');
+    if (!href) return;
+
+    try {
+      var u = new URL(a.href, window.location.href);
+      if ((u.hostname === 'www.youtube.com' || u.hostname === 'youtube.com') && !a.href.startsWith(WORKER)) {
+        e.preventDefault();
+        e.stopPropagation();
+        window.location.href = WORKER + u.pathname + u.search + u.hash;
+      }
+    } catch(_) {}
   }, true);
 })();
 <\/script>`;
       // Add version query parameter to script source to force the TV browser to bypass local JS cache
-      html = html.replace('<head>', '<head>' + inlineInterceptor + '<script src="/index.js?v=6"></script>');
+      html = html.replace('<head>', '<head>' + inlineInterceptor + '<script src="/index.js?v=7"></script>');
 
       // Rewrite static host URLs
-      html = rewriteHosts(html);
+      html = rewriteHosts(html, WORKER_ORIGIN);
 
       // FIX: Also rewrite redirector.googlevideo.com inside ytInitialPlayerResponse
       // and ytcfg JSON blobs — the player reads these at runtime to build stream URLs
@@ -549,7 +565,7 @@ self.addEventListener('fetch', function(event) {
 
     if (isText && res.status === 200) {
       let text = await res.text();
-      text = rewriteHosts(text);
+      text = rewriteHosts(text, url.origin);
 
       const finalHeaders = new Headers(res.headers);
       finalHeaders.delete('content-security-policy');
