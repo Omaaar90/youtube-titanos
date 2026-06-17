@@ -212,6 +212,12 @@ async function handleRequest(request, env, ctx) {
           bodyText = bodyText.replace('ju2WuMJMOjilz_h_1dPgFdeU', targetClientSecret);
           bodyText = bodyText.replace('SboVhoG9s0rNafixCSGGKXAT', targetClientSecret);
           
+          // Restore rewritten scopes to their original protocol/host format
+          bodyText = bodyText.replace(/(\/__proxy\/gdata\.youtube\.com)/gi, 'http://gdata.youtube.com');
+          bodyText = bodyText.replace(/\/__proxy\/([a-z0-9\-\.]+)/gi, 'https://$1');
+          bodyText = bodyText.replace(/(%2[fF]__proxy%2[fF]gdata\.youtube\.com)/gi, 'http%3A%2F%2Fgdata.youtube.com');
+          bodyText = bodyText.replace(/%2[fF]__proxy%2[fF]([a-z0-9\-\.]+)/gi, 'https%3A%2F%2F$1');
+          
           reqBody = new TextEncoder().encode(bodyText);
         } catch (e) {
           console.error('[OAuth] Failed to rewrite credentials in request body:', e.message);
