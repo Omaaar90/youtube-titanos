@@ -2,8 +2,19 @@ name = "youtube-titanos"
 main = "tools/cloudflare-worker.js"
 compatibility_date = "2024-01-01"
 
-# The YT_SESSION KV namespace is optional and handles missing bindings gracefully.
-# If you want to use KV caching, bind a KV namespace named YT_SESSION here.
+# ── Observability ──────────────────────────────────────────────────────────────
+# Enables persistent logs + traces in the Cloudflare dashboard.
+# View at: dash.cloudflare.com → Workers & Pages → youtube-titanos → Observability
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true   # captures console.log / console.error from worker code
+head_sampling_rate = 1   # 1 = 100% of requests logged (reduce to 0.1 in production)
+
+# ── KV Session Cache (optional) ───────────────────────────────────────────────
+# Uncomment and fill in your KV namespace ID to enable session cookie caching.
 # [[kv_namespaces]]
 # binding = "YT_SESSION"
 # id = "<YOUR_KV_NAMESPACE_ID>"
