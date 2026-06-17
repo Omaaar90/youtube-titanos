@@ -3,15 +3,16 @@ main = "tools/cloudflare-worker.js"
 compatibility_date = "2024-01-01"
 
 # ── Observability ──────────────────────────────────────────────────────────────
-# Enables persistent logs + traces in the Cloudflare dashboard.
-# View at: dash.cloudflare.com → Workers & Pages → youtube-titanos → Observability
+# Disabled invocation_logs to avoid inflating request/event counts on free plan.
+# Re-enable temporarily for debugging by setting invocation_logs = true
+# and head_sampling_rate = 0.1 (10% sampling).
 [observability]
 enabled = true
 
 [observability.logs]
 enabled = true
-invocation_logs = true   # captures console.log / console.error from worker code
-head_sampling_rate = 1   # 1 = 100% of requests logged (reduce to 0.1 in production)
+invocation_logs = false  # disabled: was causing ~165k extra events/day
+head_sampling_rate = 0.01  # 1% sampling - only errors/exceptions will be captured
 
 # ── KV Session Cache (optional) ───────────────────────────────────────────────
 # Uncomment and fill in your KV namespace ID to enable session cookie caching.
