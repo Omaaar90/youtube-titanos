@@ -1,16 +1,19 @@
 /**
- * YouTube-TitanOS — Cloudflare Worker Reverse Proxy v9
+ * YouTube-TitanOS — Cloudflare Worker Reverse Proxy v10
  *
- * v9 changes:
- *  - FIXED: /$WEBAPIS/webapis.js returned 404, crashing the Philips/TitanOS
- *           platform layer inside YouTube TV. YT TV then panicked and fired a
- *           full-page reload to /?is_account_switch=1, which sent the user back
- *           to the home screen on every video click. Now serves a working stub.
- *  - FIXED: Added client-side location.href assignment interception to block
- *           account-switch reload navigations before they reach the server.
- *  - FIXED: Added inline keyMode assignment guard (belt+suspenders alongside
- *           the existing unhandledrejection suppressor).
- *  - RETAINED: All v8 fixes.
+ * v10 changes:
+ *  - FIXED: window.open() replacement now calls _winOpen(u, '_self', '')
+ *           instead of assigning location.href. On Vewd/Chrome 112 the
+ *           browser engine allocates a native new tab as the return value
+ *           of window.open() BEFORE JavaScript runs. Using location.href
+ *           inside the replacement therefore opened a blank tab first, then
+ *           navigated the original tab — causing the "empty tab + home screen"
+ *           bug. Calling _winOpen(url, '_self', '') forces the engine to reuse
+ *           the current tab at the native level.
+ *  - Bump index.js cache-bust from v=10 to v=11.
+ *  - RETAINED: All v9 fixes (WebAPIs stub, keyMode guard, location.href
+ *              interceptor, cursor:none, MutationObserver _blank stripper,
+ *              click capture handler).
  */
 
 const GH_PAGES_BASE = 'https://Omaaar90.github.io/youtube-titanos';
@@ -672,18 +675,22 @@ self.addEventListener('fetch', function(event) {
 '    return _xhrSend.apply(this, arguments);\n' +
 '  };\n' +
 '\n' +
-'  // ── Patch window.open ───────────────────────────────────────────────────\n' +
+'  // ── v10 FIX: Patch window.open — use _winOpen(_self) not location.href ──\n' +
+'  // On Vewd/Chrome 112 the browser engine allocates a native new tab as the\n' +
+'  // return value of window.open() BEFORE JavaScript executes. Assigning to\n' +
+'  // location.href after the fact left that blank native tab open and navigated\n' +
+'  // the original tab — causing the "empty tab + back to home screen" bug.\n' +
+'  // Calling the original open() with target="_self" forces same-tab reuse at\n' +
+'  // the engine level, before any tab is allocated.\n' +
 '  var _winOpen = window.open;\n' +
 '  window.open = function(u, target, features) {\n' +
 '    tvlog("window_open", { url: u || "(empty)", target: target || "(none)" });\n' +
 '    if (!u || u === "about:blank" || u === "about:newtab" || u === "") return null;\n' +
 '    flagSpecial(u);\n' +
 '    u = rewriteUrl(u);\n' +
-'    if (target === "_self" || target === "_top" || target === "_parent") {\n' +
-'      return _winOpen.call(window, u, target, features);\n' +
-'    }\n' +
-'    _rl.href = u;\n' +
-'    return null;\n' +
+'    tvlog("window_open_self", { url: u });\n' +
+'    // Always force _self — never allow a new tab on a TV browser\n' +
+'    return _winOpen.call(window, u, "_self", "");\n' +
 '  };\n' +
 '\n' +
 '  // ── MutationObserver: strip _blank from injected anchors ────────────────\n' +
@@ -781,7 +788,7 @@ self.addEventListener('fetch', function(event) {
 '  *, *::before, *::after { cursor: none !important; }\n' +
 '<\/style>';
 
-    html = html.replace('<head>', '<head>' + inlineInterceptor + '<script src="/index.js?v=10"><\/script>');
+    html = html.replace('<head>', '<head>' + inlineInterceptor + '<script src="/index.js?v=11"><\/script>');
 
     html = rewriteHosts(html, WORKER_ORIGIN);
 
