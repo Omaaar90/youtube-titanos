@@ -8,6 +8,9 @@
  *  - FIXED: Suppress the Vewd-specific keyMode unhandled rejection so remote
  *           navigation does not die when YouTube TV's input manager races init.
  *  - RETAINED: v6 cookie forwarding and /__log recursion fixes.
+ *  - PERF: Module-level in-memory session cookie cache (1h TTL) to avoid
+ *          re-fetching www.youtube.com/tv on every proxied request when no
+ *          KV namespace is bound.
  */
 
 const GH_PAGES_BASE = 'https://Omaaar90.github.io/youtube-titanos';
@@ -15,6 +18,12 @@ const TV_UA = 'Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) AppleWebKit/538.1 (KHTML
 const SESSION_KV_KEY = 'yt_session_cookies';
 const SESSION_TTL = 60 * 60;
 const LOG_MAX = 200; // in-memory ring buffer size
+
+// Module-level session cookie cache (shared across requests in the same isolate).
+// Avoids fetching www.youtube.com/tv on every request when no KV namespace is bound.
+let _sessionCookieCache = null;
+let _sessionCookieCacheTs = 0;
+const SESSION_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 // Params YouTube TV uses internally to trigger account-switch UI loops.
 // We strip them before forwarding so YT boots cleanly.
@@ -59,10 +68,21 @@ function rewriteHosts(text, workerOrigin) {
 }
 
 async function getSessionCookies(env, ctx) {
+  // 1. Check module-level in-memory cache first (no network cost)
+  const now = Date.now();
+  if (_sessionCookieCache && (now - _sessionCookieCacheTs) < SESSION_CACHE_TTL_MS) {
+    return _sessionCookieCache;
+  }
+
+  // 2. Try KV if bound
   if (env.YT_SESSION) {
     try {
       const cached = await env.YT_SESSION.get(SESSION_KV_KEY);
-      if (cached) return cached;
+      if (cached) {
+        _sessionCookieCache = cached;
+        _sessionCookieCacheTs = now;
+        return cached;
+      }
     } catch (e) {
       console.warn('[session] KV read failed, falling back to live fetch:', e.message);
     }
@@ -112,6 +132,10 @@ async function getSessionCookies(env, ctx) {
   } catch (e) {
     console.error('[session] Bootstrap fetch failed, using consent-only fallback:', e.message);
   }
+
+  // Store in module-level cache
+  _sessionCookieCache = cookieString;
+  _sessionCookieCacheTs = now;
 
   return cookieString;
 }
@@ -185,6 +209,9 @@ export default {
 
   async scheduled(event, env, ctx) {
     console.info('[scheduled] Session refresh triggered at', new Date().toISOString());
+    // Clear module-level cache too so next request re-fetches fresh cookies
+    _sessionCookieCache = null;
+    _sessionCookieCacheTs = 0;
     if (env.YT_SESSION) {
       await env.YT_SESSION.delete(SESSION_KV_KEY)
         .catch(e => console.warn('[scheduled] KV delete failed:', e.message));
@@ -438,7 +465,7 @@ self.addEventListener('fetch', function(event) {
 '    history.replaceState(null, document.title, stripAccountSwitchParams(_rl.href));\n' +
 '  }\n' +
 '\n' +
-'  // ── Telemetry: POST events to /__log ──────────────────────────────────\n' +
+'  // ── Telemetry: POST events to /__log ────────────────────────────────────\n' +
 '  function tvlog(type, payload) {\n' +
 '    try {\n' +
 '      var body = JSON.stringify({ type: type, payload: payload, href: _rl.href, ts: Date.now() });\n' +
@@ -449,7 +476,7 @@ self.addEventListener('fetch', function(event) {
 '    } catch(e) {}\n' +
 '  }\n' +
 '\n' +
-'  // ── URL helpers ───────────────────────────────────────────────────────\n' +
+'  // ── URL helpers ─────────────────────────────────────────────────────────\n' +
 '  function isGoogleHost(u) {\n' +
 '    try { return GOOGLE_RE.test(new URL(u).hostname); } catch(e) { return false; }\n' +
 '  }\n' +
@@ -484,7 +511,7 @@ self.addEventListener('fetch', function(event) {
 '    if (flags.length) tvlog("special_url", { url: u, flags: flags });\n' +
 '  }\n' +
 '\n' +
-'  // ── Patch fetch ───────────────────────────────────────────────────────\n' +
+'  // ── Patch fetch ─────────────────────────────────────────────────────────\n' +
 '  var _fetch = window.fetch;\n' +
 '  window.fetch = function(input, init) {\n' +
 '    var u = (typeof input === "string") ? input : (input && input.url) || "";\n' +
@@ -504,7 +531,7 @@ self.addEventListener('fetch', function(event) {
 '    return p;\n' +
 '  };\n' +
 '\n' +
-'  // ── Patch XHR ────────────────────────────────────────────────────────\n' +
+'  // ── Patch XHR ───────────────────────────────────────────────────────────\n' +
 '  var _xhrOpen = XMLHttpRequest.prototype.open;\n' +
 '  XMLHttpRequest.prototype.open = function(method, u) {\n' +
 '    flagSpecial(u);\n' +
@@ -530,7 +557,7 @@ self.addEventListener('fetch', function(event) {
 '    return _xhrSend.apply(this, arguments);\n' +
 '  };\n' +
 '\n' +
-'  // ── Patch window.open ─────────────────────────────────────────────────\n' +
+'  // ── Patch window.open ───────────────────────────────────────────────────\n' +
 '  var _winOpen = window.open;\n' +
 '  window.open = function(u, target, features) {\n' +
 '    tvlog("window_open", { url: u || "(empty)", target: target || "(none)" });\n' +
@@ -544,7 +571,7 @@ self.addEventListener('fetch', function(event) {
 '    return null;\n' +
 '  };\n' +
 '\n' +
-'  // ── MutationObserver: strip _blank from injected anchors ──────────────\n' +
+'  // ── MutationObserver: strip _blank from injected anchors ────────────────\n' +
 '  var _mo = new MutationObserver(function(mutations) {\n' +
 '    for (var i = 0; i < mutations.length; i++) {\n' +
 '      var nodes = mutations[i].addedNodes;\n' +
@@ -559,7 +586,7 @@ self.addEventListener('fetch', function(event) {
 '  });\n' +
 '  _mo.observe(document.documentElement || document, { childList: true, subtree: true });\n' +
 '\n' +
-'  // ── Click capture: rewrite cross-origin YouTube links ─────────────────\n' +
+'  // ── Click capture: rewrite cross-origin YouTube links ───────────────────\n' +
 '  document.addEventListener("click", function(e) {\n' +
 '    var a = e.target && e.target.closest ? e.target.closest("a") : null;\n' +
 '    if (!a) return;\n' +
@@ -580,7 +607,7 @@ self.addEventListener('fetch', function(event) {
 '    } catch(err) {}\n' +
 '  }, true);\n' +
 '\n' +
-'  // ── <video> element events ────────────────────────────────────────────\n' +
+'  // ── <video> element events ───────────────────────────────────────────────\n' +
 '  var _vidMo = new MutationObserver(function(mutations) {\n' +
 '    for (var i = 0; i < mutations.length; i++) {\n' +
 '      var nodes = mutations[i].addedNodes;\n' +
@@ -613,7 +640,7 @@ self.addEventListener('fetch', function(event) {
 '  });\n' +
 '  _vidMo.observe(document.documentElement || document, { childList: true, subtree: true });\n' +
 '\n' +
-'  // ── Global error hooks ────────────────────────────────────────────────\n' +
+'  // ── Global error hooks ──────────────────────────────────────────────────\n' +
 '  window.onerror = function(msg, src, line, col, err) {\n' +
 '    tvlog("js_error", { message: msg, source: src, line: line, col: col, stack: err ? String(err.stack) : null });\n' +
 '    return false;\n' +
