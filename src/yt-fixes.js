@@ -18,18 +18,26 @@ export function initYouTubeFixes() {
  *  1. Capture-phase click listener: strip target="_blank" before the browser
  *     acts on it, then let the click propagate normally (YouTube's own handler
  *     will navigate within the same frame via its router).
- *  2. Patch window.open(): route any call to same-tab navigation instead.
+ *  2. Patch window.open(): force _self target so Vewd reuses the current tab
+ *     instead of spawning a new blank one.
  */
 function initLinkFix() {
     const WORKER = window.location.origin;
+    const GOOGLE_CDN_RE = /(?:googlevideo|ytimg|ggpht|gstatic|googleapis)\.com$/;
 
     function rewriteUrl(url) {
         if (typeof url !== 'string') return url;
         if (url.startsWith(WORKER)) return url;
         try {
             const u = new URL(url, window.location.href);
+            // Rewrite youtube.com paths to go through the worker origin
             if (u.hostname === 'www.youtube.com' || u.hostname === 'youtube.com') {
                 return WORKER + u.pathname + u.search + u.hash;
+            }
+            // Rewrite googlevideo/ytimg/etc. through the proxy path so
+            // initplayback and media URLs are routed correctly on Vewd
+            if (GOOGLE_CDN_RE.test(u.hostname)) {
+                return WORKER + '/__proxy/' + u.hostname + u.pathname + u.search + u.hash;
             }
         } catch (e) {}
         return url;
@@ -58,20 +66,21 @@ function initLinkFix() {
         } catch (_) {}
     }, true /* capture */);
 
-    // 2. Block window.open() — YouTube TV rarely uses this, but just in case
+    // 2. Patch window.open() — force _self so Vewd never spawns a blank tab.
+    //    Using location.href is NOT sufficient: by the time JS sets it, Vewd's
+    //    browser engine has already allocated a native new tab as the return
+    //    value of window.open(). Calling _open(url, '_self') instead makes the
+    //    browser reuse the current tab at the engine level.
     const _open = window.open.bind(window);
     window.open = function(url, target, features) {
-        if (url) {
-            url = rewriteUrl(url);
+        // Let blank/empty opens return null — Vewd uses these for internal purposes
+        if (!url || url === 'about:blank' || url === 'about:newtab' || url === '') {
+            return null;
         }
-        if (target === '_self' || target === '_top' || target === '_parent') {
-            return _open(url, target, features);
-        }
-        if (url) {
-            console.log('[YT-Fixes] Intercepted window.open(), redirecting same-tab:', url);
-            window.location.href = url;
-        }
-        return null;
+        url = rewriteUrl(url);
+        console.log('[YT-Fixes] window.open intercepted, forcing _self:', url);
+        // Always force same-tab navigation regardless of requested target
+        return _open(url, '_self', '');
     };
 
     console.log('[YT-Fixes] Link/new-tab fix active.');
@@ -231,4 +240,6 @@ function populateSearchHistory(container) {
 }
 
 window.addEventListener('beforeunload', cleanupYouTubeFixes);
-initYouTubeFixes();
+// NOTE: initYouTubeFixes() is called once via the module import side-effect
+// in index.js (await import('./yt-fixes.js')). Do NOT add a second call here
+// or window.open / click listeners will be registered twice.
