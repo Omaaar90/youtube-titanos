@@ -1,16 +1,20 @@
 /**
- * YouTube-TitanOS — Cloudflare Worker Reverse Proxy v7
+ * YouTube-TitanOS — Cloudflare Worker Reverse Proxy v8
  *
- * v7 changes:
- *  - FIXED: Strip is_account_switch=1, hrld=1, fltor=1 params client-side too.
- *           YouTube TV was re-introducing them via History API / location writes,
- *           which caused the TV browser to reload into the account-switch loop.
- *  - FIXED: Suppress the Vewd-specific keyMode unhandled rejection so remote
- *           navigation does not die when YouTube TV's input manager races init.
- *  - RETAINED: v6 cookie forwarding and /__log recursion fixes.
- *  - PERF: Module-level in-memory session cookie cache (1h TTL) to avoid
- *          re-fetching www.youtube.com/tv on every proxied request when no
- *          KV namespace is bound.
+ * v8 changes:
+ *  - FIXED: youtubei/v1/player and other API responses now have
+ *           rewriteHosts() applied so videoplayback / DASH / HLS URLs
+ *           inside JSON are rewritten through the proxy. On Vewd the
+ *           player was getting raw googlevideo.com URLs it could not
+ *           fetch directly, causing videos to stall at the loading screen.
+ *  - FIXED: Set TV_UA on youtubei/ requests so YouTube returns H.264
+ *           streams instead of VP9/AV1 which Vewd cannot decode.
+ *  - FIXED: DASH (application/dash+xml) and HLS (mpegurl/m3u8) manifest
+ *           bodies in /__proxy/ are now rewritten so segment URLs inside
+ *           manifests point back through the Worker.
+ *  - RETAINED: All v7 fixes (account-switch param stripping, keyMode
+ *              rejection suppression, cookie forwarding, log recursion fix,
+ *              in-memory session cookie cache).
  */
 
 const GH_PAGES_BASE = 'https://Omaaar90.github.io/youtube-titanos';
@@ -252,6 +256,10 @@ async function handleRequest(request, env, ctx) {
   }
 
   // ── Fast-path: youtubei/v1/* API calls ────────────────────────────────────
+  // v8 FIX: Set TV_UA so YouTube returns H.264 streams (not VP9/AV1).
+  // v8 FIX: Rewrite response body so videoplayback/DASH/HLS URLs inside
+  //         player JSON go through the Worker proxy instead of being fetched
+  //         directly by Vewd (which fails with CORS/network errors).
   if (url.pathname.startsWith('/youtubei/')) {
     const apiUrl = new URL(request.url);
     apiUrl.protocol = 'https:';
@@ -267,6 +275,8 @@ async function handleRequest(request, env, ctx) {
     reqHeaders.set('host', 'www.youtube.com');
     reqHeaders.set('origin', 'https://www.youtube.com');
     reqHeaders.set('referer', 'https://www.youtube.com/tv');
+    // Set TV UA so YouTube picks H.264 codec profiles Vewd can decode
+    reqHeaders.set('User-Agent', TV_UA);
     reqHeaders.delete('cf-connecting-ip');
     reqHeaders.delete('cf-ray');
     reqHeaders.delete('cf-visitor');
@@ -282,16 +292,34 @@ async function handleRequest(request, env, ctx) {
       redirect: 'follow',
     });
 
+    const ct = res.headers.get('content-type') || '';
+
     trace(reqId, 'youtubei_res', {
       status: res.status,
-      type: res.headers.get('content-type'),
+      type: ct,
       location: res.headers.get('location'),
     });
 
     const h = new Headers(res.headers);
     h.delete('content-security-policy');
     h.delete('content-security-policy-report-only');
+    h.delete('content-encoding');
+    h.delete('transfer-encoding');
     for (const [k, v] of Object.entries(CORS)) h.set(k, v);
+
+    // Rewrite stream URLs inside JSON/JS/text API responses.
+    // Binary responses (protobuf, octet-stream) are streamed as-is.
+    const isTextResponse =
+      ct.includes('json') ||
+      ct.includes('javascript') ||
+      ct.includes('text/');
+
+    if (isTextResponse && res.status === 200) {
+      let text = await res.text();
+      text = rewriteHosts(text, url.origin);
+      return new Response(text, { status: res.status, headers: h });
+    }
+
     return new Response(res.body, { status: res.status, headers: h });
   }
 
@@ -763,6 +791,23 @@ self.addEventListener('fetch', function(event) {
     // Also forward auth cookies from proxied Google/accounts responses
     if (upHost.includes('accounts.google') || upHost.includes('google.com')) {
       forwardSetCookies(res.headers, h, url.hostname);
+    }
+
+    // v8 FIX: Rewrite DASH manifest and HLS playlist bodies so that segment
+    // and stream URLs inside them are routed through the Worker proxy.
+    // Media streams (videoplayback) are still streamed directly — no buffering.
+    const proxyContentType = res.headers.get('content-type') || '';
+    const isManifest =
+      proxyContentType.includes('dash+xml') ||
+      proxyContentType.includes('mpegurl') ||
+      proxyContentType.includes('m3u8');
+
+    if (isManifest && res.status === 200) {
+      h.delete('content-encoding');
+      h.delete('transfer-encoding');
+      let manifestText = await res.text();
+      manifestText = rewriteHosts(manifestText, url.origin);
+      return new Response(manifestText, { status: res.status, headers: h });
     }
 
     return new Response(res.body, { status: res.status, headers: h });
