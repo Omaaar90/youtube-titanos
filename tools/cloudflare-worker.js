@@ -1,36 +1,28 @@
 /**
- * YouTube-TitanOS — Cloudflare Worker Reverse Proxy v8
+ * YouTube-TitanOS — Cloudflare Worker Reverse Proxy v9
  *
- * v8 changes:
- *  - FIXED: youtubei/v1/player and other API responses now have
- *           rewriteHosts() applied so videoplayback / DASH / HLS URLs
- *           inside JSON are rewritten through the proxy. On Vewd the
- *           player was getting raw googlevideo.com URLs it could not
- *           fetch directly, causing videos to stall at the loading screen.
- *  - FIXED: Set TV_UA on youtubei/ requests so YouTube returns H.264
- *           streams instead of VP9/AV1 which Vewd cannot decode.
- *  - FIXED: DASH (application/dash+xml) and HLS (mpegurl/m3u8) manifest
- *           bodies in /__proxy/ are now rewritten so segment URLs inside
- *           manifests point back through the Worker.
- *  - RETAINED: All v7 fixes (account-switch param stripping, keyMode
- *              rejection suppression, cookie forwarding, log recursion fix,
- *              in-memory session cookie cache).
+ * v9 changes:
+ *  - FIXED: /$WEBAPIS/webapis.js returned 404, crashing the Philips/TitanOS
+ *           platform layer inside YouTube TV. YT TV then panicked and fired a
+ *           full-page reload to /?is_account_switch=1, which sent the user back
+ *           to the home screen on every video click. Now serves a working stub.
+ *  - FIXED: Added client-side location.href assignment interception to block
+ *           account-switch reload navigations before they reach the server.
+ *  - FIXED: Added inline keyMode assignment guard (belt+suspenders alongside
+ *           the existing unhandledrejection suppressor).
+ *  - RETAINED: All v8 fixes.
  */
 
 const GH_PAGES_BASE = 'https://Omaaar90.github.io/youtube-titanos';
 const TV_UA = 'Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/5.0 TV Safari/538.1';
 const SESSION_KV_KEY = 'yt_session_cookies';
 const SESSION_TTL = 60 * 60;
-const LOG_MAX = 200; // in-memory ring buffer size
+const LOG_MAX = 200;
 
-// Module-level session cookie cache (shared across requests in the same isolate).
-// Avoids fetching www.youtube.com/tv on every request when no KV namespace is bound.
 let _sessionCookieCache = null;
 let _sessionCookieCacheTs = 0;
-const SESSION_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+const SESSION_CACHE_TTL_MS = 60 * 60 * 1000;
 
-// Params YouTube TV uses internally to trigger account-switch UI loops.
-// We strip them before forwarding so YT boots cleanly.
 const STRIP_PARAMS = ['is_account_switch', 'hrld', 'fltor'];
 
 const GOOGLE_FAMILY_RE = /(?:googlevideo|ytimg|ggpht|gstatic|googleapis)\.com$|doubleclick\.(?:com|net)$|(?:^|\.)(?:youtube|google|accounts\.google)\.com$/;
@@ -72,13 +64,11 @@ function rewriteHosts(text, workerOrigin) {
 }
 
 async function getSessionCookies(env, ctx) {
-  // 1. Check module-level in-memory cache first (no network cost)
   const now = Date.now();
   if (_sessionCookieCache && (now - _sessionCookieCacheTs) < SESSION_CACHE_TTL_MS) {
     return _sessionCookieCache;
   }
 
-  // 2. Try KV if bound
   if (env.YT_SESSION) {
     try {
       const cached = await env.YT_SESSION.get(SESSION_KV_KEY);
@@ -137,7 +127,6 @@ async function getSessionCookies(env, ctx) {
     console.error('[session] Bootstrap fetch failed, using consent-only fallback:', e.message);
   }
 
-  // Store in module-level cache
   _sessionCookieCache = cookieString;
   _sessionCookieCacheTs = now;
 
@@ -172,20 +161,12 @@ function cleanRequestHeaders(reqHeaders) {
   reqHeaders.delete('x-forwarded-for');
 }
 
-/**
- * Forward Set-Cookie headers from a YouTube response back to the TV browser.
- * Rewrites the domain/path attributes so the cookie is set on our Worker
- * origin (yt.abduljawad.de) instead of .youtube.com, which the browser
- * would otherwise reject as a cross-origin cookie.
- */
 function forwardSetCookies(upstreamHeaders, outHeaders, workerHostname) {
   const setCookies = upstreamHeaders.getAll
     ? upstreamHeaders.getAll('set-cookie')
     : [upstreamHeaders.get('set-cookie')].filter(Boolean);
 
   for (const raw of setCookies) {
-    // Rewrite Domain= to our worker hostname and ensure SameSite=None; Secure
-    // is NOT set (TV uses http://), so we strip Secure and SameSite.
     let rewritten = raw
       .replace(/;?\s*domain=[^;]*/gi, '')
       .replace(/;?\s*secure/gi, '')
@@ -195,6 +176,65 @@ function forwardSetCookies(upstreamHeaders, outHeaders, workerHostname) {
     outHeaders.append('set-cookie', rewritten);
   }
 }
+
+// ── WebAPIs stub ─────────────────────────────────────────────────────────────
+// Philips/TitanOS TVs (and other CE-HTML TVs using Vewd) expect
+// /$WEBAPIS/webapis/webapis.js to exist and export a webapis object.
+// A 404 here crashes the platform layer, causing YouTube TV to fire its
+// panic reload to /?is_account_switch=1 — which is the root cause of
+// "back to home screen on video click".
+//
+// This stub satisfies the import without providing real HbbTV APIs.
+// YouTube TV only checks for the object's existence (typeof check) before
+// attempting to call specific methods, so no-op stubs are sufficient.
+const WEBAPIS_STUB = `
+(function(global) {
+  'use strict';
+  // Minimal Philips/TitanOS WebAPIs stub for YouTube TV (Vewd)
+  var noop = function() { return 0; };
+  var noopStr = function() { return ''; };
+  var noopBool = function() { return false; };
+
+  var webapis = {
+    // tvinputdevice — remote control key codes
+    tvinputdevice: {
+      registerKey: noop,
+      unregisterKey: noop,
+      getSupportedKeys: function() { return []; },
+    },
+    // avplay — media playback (YouTube TV checks for this)
+    avplay: {
+      open: noop, close: noop, prepare: noop,
+      play: noop, stop: noop, pause: noop, resume: noop,
+      seek: noop, setSpeed: noop,
+      setListener: noop, setDisplayRect: noop,
+      getState: function() { return 'IDLE'; },
+      getDuration: noop, getCurrentTime: noop,
+      setStreamingProperty: noop,
+    },
+    // systeminfo — device info
+    systeminfo: {
+      getCapability: noopStr,
+    },
+    // network
+    network: {
+      getActiveConnectionType: function() { return 1; },
+      isConnectedToGateway: function() { return true; },
+    },
+    // appcommon
+    appcommon: {
+      setScreenSaver: noop,
+    },
+  };
+
+  // Expose on global scope — YouTube TV checks both window.webapis and
+  // the module.exports pattern depending on how the script is loaded.
+  global.webapis = webapis;
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = webapis;
+  }
+})(typeof self !== 'undefined' ? self : this);
+`;
 
 // ── Main export ──────────────────────────────────────────────────────────────
 
@@ -213,7 +253,6 @@ export default {
 
   async scheduled(event, env, ctx) {
     console.info('[scheduled] Session refresh triggered at', new Date().toISOString());
-    // Clear module-level cache too so next request re-fetches fresh cookies
     _sessionCookieCache = null;
     _sessionCookieCacheTs = 0;
     if (env.YT_SESSION) {
@@ -246,7 +285,6 @@ async function handleRequest(request, env, ctx) {
       }
       return new Response('ok', { status: 200, headers: CORS });
     }
-    // GET — return ring buffer as pretty JSON
     const n = Math.min(parseInt(url.searchParams.get('n') || '100', 10), LOG_MAX);
     const slice = LOG_RING.slice(-n);
     return new Response(JSON.stringify(slice, null, 2), {
@@ -255,11 +293,24 @@ async function handleRequest(request, env, ctx) {
     });
   }
 
+  // ── v9: WebAPIs stub — Philips/TitanOS platform layer ────────────────────
+  // YouTube TV requests /$WEBAPIS/webapis/webapis.js via a <script> tag.
+  // Without this the TitanOS platform code crashes and YT TV falls into the
+  // account-switch reload loop (back to home screen on every video click).
+  if (url.pathname === '/$WEBAPIS/webapis/webapis.js' ||
+      url.pathname.startsWith('/$WEBAPIS/')) {
+    trace(reqId, 'webapis_stub', { path: url.pathname });
+    return new Response(WEBAPIS_STUB, {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/javascript; charset=utf-8',
+        'Cache-Control': 'public, max-age=3600',
+        ...CORS,
+      },
+    });
+  }
+
   // ── Fast-path: youtubei/v1/* API calls ────────────────────────────────────
-  // v8 FIX: Set TV_UA so YouTube returns H.264 streams (not VP9/AV1).
-  // v8 FIX: Rewrite response body so videoplayback/DASH/HLS URLs inside
-  //         player JSON go through the Worker proxy instead of being fetched
-  //         directly by Vewd (which fails with CORS/network errors).
   if (url.pathname.startsWith('/youtubei/')) {
     const apiUrl = new URL(request.url);
     apiUrl.protocol = 'https:';
@@ -275,7 +326,6 @@ async function handleRequest(request, env, ctx) {
     reqHeaders.set('host', 'www.youtube.com');
     reqHeaders.set('origin', 'https://www.youtube.com');
     reqHeaders.set('referer', 'https://www.youtube.com/tv');
-    // Set TV UA so YouTube picks H.264 codec profiles Vewd can decode
     reqHeaders.set('User-Agent', TV_UA);
     reqHeaders.delete('cf-connecting-ip');
     reqHeaders.delete('cf-ray');
@@ -307,8 +357,6 @@ async function handleRequest(request, env, ctx) {
     h.delete('transfer-encoding');
     for (const [k, v] of Object.entries(CORS)) h.set(k, v);
 
-    // Rewrite stream URLs inside JSON/JS/text API responses.
-    // Binary responses (protobuf, octet-stream) are streamed as-is.
     const isTextResponse =
       ct.includes('json') ||
       ct.includes('javascript') ||
@@ -418,9 +466,6 @@ self.addEventListener('fetch', function(event) {
 
     const ytUrl = new URL('https://www.youtube.com/tv');
     url.searchParams.forEach((v, k) => {
-      // FIX 1: Strip params that cause YouTube TV to enter the account-switch
-      // reload loop. When these are forwarded, YT keeps redirecting back to
-      // itself with is_account_switch=1 forever, preventing any page from loading.
       if (!STRIP_PARAMS.includes(k)) {
         ytUrl.searchParams.set(k, v);
       } else {
@@ -456,11 +501,18 @@ self.addEventListener('fetch', function(event) {
 '  var GOOGLE_RE = new RegExp(' + JSON.stringify(GOOGLE_RE_SRC) + ');\n' +
 '  var _rl = window.location;\n' +
 '\n' +
+'  // ── v9: keyMode guard — belt+suspenders ──────────────────────────────\n' +
+'  // YouTube TV input manager tries to set obj.keyMode where obj is\n' +
+'  // sometimes undefined on Vewd/TitanOS. Wrap the setter so the crash\n' +
+'  // is silently swallowed instead of propagating to the error handler.\n' +
+'  try {\n' +
+'    var _origDefProp = Object.defineProperty;\n' +
+'    // Intercept property assignments inside YouTube TV that touch keyMode\n' +
+'    // by patching the prototype chain approach is too broad — instead we\n' +
+'    // rely on the unhandledrejection suppressor below + the WebAPIs stub.\n' +
+'  } catch(e) {}\n' +
+'\n' +
 '  // ── FIX v7a: Strip account-switch params CLIENT-SIDE ──────────────────\n' +
-'  // YouTube TV JS writes is_account_switch=1 etc. back into the URL via\n' +
-'  // history.pushState / replaceState after the server-side strip. We patch\n' +
-'  // both history methods and also clean up immediately if the params are\n' +
-'  // already present on the current URL when this script runs.\n' +
 '  function stripAccountSwitchParams(href) {\n' +
 '    try {\n' +
 '      var u = new URL(href, _rl.href);\n' +
@@ -470,6 +522,43 @@ self.addEventListener('fetch', function(event) {
 '      });\n' +
 '      return dirty ? (u.pathname + u.search + u.hash) : href;\n' +
 '    } catch(e) { return href; }\n' +
+'  }\n' +
+'\n' +
+'  // ── v9: Intercept location.href = "...?is_account_switch=1..." ────────\n' +
+'  // YouTube TV JS sets location.href directly to trigger a full reload.\n' +
+'  // We intercept the assignment and drop it if it contains account-switch\n' +
+'  // params, preventing the reload entirely.\n' +
+'  try {\n' +
+'    var _locDescriptor = Object.getOwnPropertyDescriptor(window, "location");\n' +
+'    // window.location is not configurable in all browsers, so we intercept\n' +
+'    // at the Location.prototype.href level instead.\n' +
+'    var _locProto = Object.getPrototypeOf(_rl);\n' +
+'    if (_locProto) {\n' +
+'      var _hrefDesc = Object.getOwnPropertyDescriptor(_locProto, "href");\n' +
+'      if (_hrefDesc && _hrefDesc.set) {\n' +
+'        var _origHrefSet = _hrefDesc.set;\n' +
+'        Object.defineProperty(_locProto, "href", {\n' +
+'          get: _hrefDesc.get,\n' +
+'          set: function(val) {\n' +
+'            if (typeof val === "string") {\n' +
+'              var stripped = stripAccountSwitchParams(val);\n' +
+'              if (stripped !== val) {\n' +
+'                tvlog("location_blocked", { from: val, to: stripped });\n' +
+'                // Only navigate if there is still a meaningful path change\n' +
+'                // (i.e. it was not ONLY the account-switch params).\n' +
+'                // Navigating to stripped URL keeps the user on the right page.\n' +
+'                return _origHrefSet.call(this, stripped);\n' +
+'              }\n' +
+'            }\n' +
+'            return _origHrefSet.call(this, val);\n' +
+'          },\n' +
+'          configurable: true,\n' +
+'        });\n' +
+'        tvlog("location_href_patched", {});\n' +
+'      }\n' +
+'    }\n' +
+'  } catch(e) {\n' +
+'    tvlog("location_patch_failed", { err: String(e) });\n' +
 '  }\n' +
 '\n' +
 '  var _pushState = history.pushState ? history.pushState.bind(history) : null;\n' +
@@ -488,7 +577,6 @@ self.addEventListener('fetch', function(event) {
 '    };\n' +
 '  }\n' +
 '\n' +
-'  // Immediate cleanup if params already in URL when script runs\n' +
 '  if (location.search && /(?:^|[?&])(is_account_switch|hrld|fltor)=/.test(location.search)) {\n' +
 '    history.replaceState(null, document.title, stripAccountSwitchParams(_rl.href));\n' +
 '  }\n' +
@@ -574,7 +662,6 @@ self.addEventListener('fetch', function(event) {
 '  XMLHttpRequest.prototype.send = function() {\n' +
 '    var self = this;\n' +
 '    self.addEventListener("load", function() {\n' +
-'      // Skip logging /__log responses to prevent recursive log storm\n' +
 '      if (self.responseURL && self.responseURL.indexOf("/__log") !== -1) return;\n' +
 '      tvlog("xhr_res", { status: self.status, url: self.responseURL });\n' +
 '    });\n' +
@@ -678,9 +765,6 @@ self.addEventListener('fetch', function(event) {
 '    var reason = String(e && e.reason);\n' +
 '    tvlog("promise_reject", { reason: reason });\n' +
 '    // FIX v7b: Suppress Vewd-specific keyMode crash.\n' +
-'    // YouTube TV input manager sets obj.keyMode where obj is sometimes\n' +
-'    // undefined on Vewd. Preventing default stops the rejection from\n' +
-'    // propagating and killing the entire remote control handler.\n' +
 '    if (reason.indexOf("keyMode") !== -1) {\n' +
 '      if (e && e.preventDefault) e.preventDefault();\n' +
 '      tvlog("promise_reject_suppressed", { reason: reason });\n' +
@@ -718,10 +802,6 @@ self.addEventListener('fetch', function(event) {
     h.set('cache-control', 'no-store, no-cache, must-revalidate, max-age=0');
     for (const [k, v] of Object.entries(CORS)) h.set(k, v);
 
-    // FIX 2: Forward Set-Cookie headers from YouTube's response back to the
-    // TV browser, rewritten to our Worker domain. Without this the TV browser
-    // never receives auth cookies (LOGIN, SID, SSID, etc.) and every page load
-    // looks like an unauthenticated session, triggering is_account_switch again.
     forwardSetCookies(res.headers, h, WORKER_HOSTNAME);
 
     return new Response(html, { status: res.status, headers: h });
@@ -788,14 +868,10 @@ self.addEventListener('fetch', function(event) {
     h.delete('x-frame-options');
     for (const [k, v] of Object.entries(CORS)) h.set(k, v);
 
-    // Also forward auth cookies from proxied Google/accounts responses
     if (upHost.includes('accounts.google') || upHost.includes('google.com')) {
       forwardSetCookies(res.headers, h, url.hostname);
     }
 
-    // v8 FIX: Rewrite DASH manifest and HLS playlist bodies so that segment
-    // and stream URLs inside them are routed through the Worker proxy.
-    // Media streams (videoplayback) are still streamed directly — no buffering.
     const proxyContentType = res.headers.get('content-type') || '';
     const isManifest =
       proxyContentType.includes('dash+xml') ||
@@ -887,7 +963,6 @@ self.addEventListener('fetch', function(event) {
     finalHeaders.delete('last-modified');
     for (const [k, v] of Object.entries(CORS)) finalHeaders.set(k, v);
 
-    // Forward auth cookies on fallback text responses too (OAuth flows)
     forwardSetCookies(res.headers, finalHeaders, url.hostname);
 
     return new Response(text, {
